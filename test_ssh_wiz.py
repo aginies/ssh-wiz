@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tests for ssh-wiz. Run:  python3 test_ssh_wiz.py  (or: python3 -m unittest)"""
 import contextlib
 import importlib.machinery
@@ -77,7 +76,7 @@ class ParseSshConfigTest(TempPathsTestCase):
 
     def test_host_patterns_skipped(self):
         self.write_config("Host *.wild foo\n  User w\n")
-        hosts, order = shw.parse_ssh_config(self.ssh_config)
+        _hosts, order = shw.parse_ssh_config(self.ssh_config)
         self.assertEqual(order, ["foo"])
 
 

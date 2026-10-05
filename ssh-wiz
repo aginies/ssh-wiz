@@ -91,7 +91,7 @@ def _valid_color(c: str) -> bool:
     try:
         Style.parse(c)
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 - any parse failure means "not a valid color"
         return False
 
 
@@ -398,7 +398,7 @@ def copy_to_clipboard(text: str) -> bool:
             try:
                 subprocess.run(tool, input=text.encode(), check=True, timeout=2)
                 return True
-            except Exception:
+            except Exception:  # noqa: BLE001, S112 - just try the next clipboard tool
                 continue
     return False
 
@@ -469,8 +469,7 @@ class HostList(Widget):
             return t
         # Keep the cursor visible; when possible leave one row of lookahead
         # below it (at the end of the list the cursor sits on the last row).
-        if self.cursor < self.scroll:
-            self.scroll = self.cursor
+        self.scroll = min(self.scroll, self.cursor)
         if self.cursor >= self.scroll + height - 1:
             self.scroll = self.cursor - height + 2
         self.scroll = max(0, self.scroll)
@@ -637,7 +636,7 @@ class SSHWiz(App):
         record_use(host.name)
         try:
             with self.suspend():
-                rc = subprocess.run(cmd).returncode
+                rc = subprocess.run(cmd, check=False).returncode
         except SuspendNotSupported:
             self.notify("terminal does not support suspend — run: " + " ".join(cmd),
                         severity="error")
@@ -684,7 +683,7 @@ class SSHWiz(App):
                         f"opened ~/.ssh/config at top", severity="warning")
         try:
             with self.suspend():
-                subprocess.run(args)
+                subprocess.run(args, check=False)
         except SuspendNotSupported:
             self.notify("terminal does not support suspend", severity="error")
             return
