@@ -15,6 +15,7 @@ Usage:
   ssh-wiz -f <host>    toggle favorite
   ssh-wiz --complete <prefix>   print hosts/flags matching prefix (completion)
   ssh-wiz --completion <shell>  print completion script (bash, zsh or fish)
+  ssh-wiz --version    print the version
   ssh-wiz -h           this help
 
 TUI keys:
@@ -52,6 +53,9 @@ from rich.console import Console
 from rich.markup import escape
 from rich.style import Style
 from rich.text import Text
+
+__version__ = "1.0.0"
+
 
 def _ssh_config_path() -> Path:
     """~/.ssh/config, or $SSH_CONFIG if set (ssh honors the same variable)."""
@@ -899,7 +903,7 @@ class SSHWiz(App):
 # Flags offered for '-...' prefixes (single source of truth; the completion
 # scripts only encode argument positions).
 CLI_FLAGS = ("-l", "--list", "-f", "-p", "--password", "-t", "--tmux",
-             "--complete", "--completion", "-h", "--help")
+             "--complete", "--completion", "-h", "--help", "-V", "--version")
 
 
 def complete_candidates(prefix: str) -> list:
@@ -968,6 +972,9 @@ def main() -> None:
         return
     if args[0] in ("-h", "--help"):
         print(__doc__.strip())
+        return
+    if args[0] in ("-V", "--version"):
+        print(f"ssh-wiz {__version__}")
         return
     if args[0] == "--complete":
         prefix = args[1] if len(args) > 1 else ""

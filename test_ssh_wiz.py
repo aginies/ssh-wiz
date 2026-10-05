@@ -432,6 +432,12 @@ class CliTest(TempPathsTestCase):
             self.run_main("-h")
         self.assertIn("ssh-wiz", out.getvalue())
 
+    def test_version(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--version")
+        self.assertEqual(out.getvalue().strip(), f"ssh-wiz {shw.__version__}")
+
     def test_list(self):
         self.ssh_config.write_text("Host foo\n  User alice\n")
         out = io.StringIO()
