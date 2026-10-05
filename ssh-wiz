@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ssh-wiz — fast interactive SSH host picker (console TUI).
 
-Hosts are read from ~/.ssh/config (plus optional ~/.config/ssh-wiz/hosts;
-categories from ~/.config/ssh-wiz/categories).
+Hosts are read from ~/.ssh/config (or $SSH_CONFIG if set), plus optional
+~/.config/ssh-wiz/hosts; categories from ~/.config/ssh-wiz/categories.
 Favorites and most-recently-used hosts are kept at the top.
 
 Usage:
@@ -13,6 +13,8 @@ Usage:
   ssh-wiz -p <host>    connect directly with -o PubkeyAuthentication=no
   ssh-wiz -t <host>    connect directly inside a per-host tmux session
   ssh-wiz -f <host>    toggle favorite
+  ssh-wiz --complete <prefix>   print hosts/flags matching prefix (completion)
+  ssh-wiz --completion <shell>  print completion script (bash, zsh or fish)
   ssh-wiz -h           this help
 
 TUI keys:
@@ -51,7 +53,13 @@ from rich.markup import escape
 from rich.style import Style
 from rich.text import Text
 
-SSH_CONFIG = Path.home() / ".ssh" / "config"
+def _ssh_config_path() -> Path:
+    """~/.ssh/config, or $SSH_CONFIG if set (ssh honors the same variable)."""
+    return Path(os.environ.get("SSH_CONFIG")
+                or (Path.home() / ".ssh" / "config")).expanduser()
+
+
+SSH_CONFIG = _ssh_config_path()
 CONFIG_DIR = Path.home() / ".config" / "ssh-wiz"
 STATE_DIR = Path.home() / ".local" / "state" / "ssh-wiz"
 FAVORITES_FILE = CONFIG_DIR / "favorites"
@@ -135,11 +143,23 @@ def category_colors(hosts: list[Host], rules: list) -> dict:
 # --------------------------------------------------------------- storage
 
 def load_usage() -> dict:
+    """{host: [connect timestamps]} — malformed entries are dropped, so a
+    hand-edited usage.json can never crash the tool."""
     try:
         data = json.loads(USAGE_FILE.read_text())
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    usage = {}
+    for name, ts in data.items():
+        if not isinstance(ts, list):
+            continue
+        clean = [t for t in ts
+                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
+        if clean:
+            usage[name] = clean
+    return usage
 
 
 def record_use(name: str) -> None:
@@ -190,6 +210,8 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
     """Parse ~/.ssh/config -> (hosts dict, ordered names).
 
     ssh semantics: first value seen wins per host. Match blocks are skipped.
+    Comments: a '#' at line start, or preceded by whitespace, starts a
+    comment.
     """
     hosts: dict = {}
     order: list = []
@@ -198,10 +220,18 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
     current: list = []
     in_match = False
     for raw in path.read_text().splitlines():
-        parts = raw.strip().split(None, 1)
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
         if len(parts) < 2:
             continue
         key, value = parts[0].lower(), parts[1].strip()
+        m = re.search(r"(^|\s)#", value)
+        if m:
+            value = value[:m.start()].strip()
+            if not value:
+                continue
         if key == "match":
             in_match = True
             current = []
@@ -307,9 +337,14 @@ def build_hosts(rules: list | None = None) -> list[Host]:
         user, at, rest = target.partition("@")
         if not at:  # no user given: whole target is the host
             user, rest = "", target
-        hostpart, sep, port = rest.rpartition(":")
-        if not sep or not port.isdigit():
-            port, hostpart = "", rest
+        hostpart, port = rest, ""
+        inner, sep, maybe_port = rest.rpartition(":")
+        if sep and maybe_port.isdigit():
+            if inner.startswith("[") and inner.endswith("]"):
+                hostpart, port = inner[1:-1], maybe_port  # [v6]:port
+            elif ":" not in inner:
+                hostpart, port = inner, maybe_port  # host:port
+        # else: bare host, or bare IPv6 (no port)
         user = user or _default_user()
         display = user + "@" + hostpart + (f":{port}" if port else "")
         hosts.append(Host(
@@ -350,6 +385,35 @@ def rank_hosts(hosts: list[Host]) -> tuple[list[Host], set]:
                 h.name.lower())
 
     return sorted(hosts, key=sort_key), favs
+
+
+def favorite_split(shown: list, favs: set) -> int:
+    """Number of leading favorites in a ranked list (they form a prefix).
+
+    rank_hosts puts favorites first; the list renders a separator line
+    below the prefix when it is non-empty and not the whole list.
+    """
+    n = 0
+    for h in shown:
+        if h.name not in favs:
+            break
+        n += 1
+    return n
+
+
+def triage_hosts(shown: list, favs: set, cat_order: list) -> list:
+    """Favorites first (rank order), then non-favorites grouped by category
+    in cat_order (rank order within each group)."""
+    by_cat: dict = {}
+    for h in shown:
+        if h.name not in favs:
+            by_cat.setdefault(h.category, []).append(h)
+    out = [h for h in shown if h.name in favs]
+    for cat in cat_order:
+        if cat != ALL_CATEGORY:
+            out.extend(by_cat.pop(cat, []))
+    out.extend(h for hs in by_cat.values() for h in hs)
+    return out
 
 
 def build_ssh_cmd(host: Host, password_mode: bool, tmux_mode: bool = False,
@@ -456,6 +520,10 @@ class HostList(Widget):
                       and (not f or fuzzy_match(f,
                            (h.name + " " + h.display + " " +
                             h.category).lower()))]
+        if cat == ALL_CATEGORY:
+            # triage: keep the favorites block, group the rest per category
+            self.shown = triage_hosts(self.shown, self.favs,
+                                      self.app.categories)
         self.cursor = min(self.cursor, max(0, len(self.shown) - 1))
         self.refresh()
 
@@ -467,31 +535,53 @@ class HostList(Widget):
                    else "no hosts found — check ~/.ssh/config")
             t.append(f"  {msg}", style="dim")
             return t
+        # Layout: top border below the top bar, favorites block, a dim
+        # separator, then non-favorites grouped by category (ALL view) with
+        # a header per group.
+        n_fav = favorite_split(self.shown, self.favs)
+        rows: list = [("sep", None)]
+        rows.extend(("host", i) for i in range(n_fav))
+        if 0 < n_fav < len(self.shown):
+            rows.append(("sep", None))
+        prev_cat = None
+        for i in range(n_fav, len(self.shown)):
+            h = self.shown[i]
+            if self.app.current_cat == ALL_CATEGORY and h.category != prev_cat:
+                rows.append(("hdr", h.category))
+            rows.append(("host", i))
+            prev_cat = h.category
         # Keep the cursor visible; when possible leave one row of lookahead
         # below it (at the end of the list the cursor sits on the last row).
-        self.scroll = min(self.scroll, self.cursor)
-        if self.cursor >= self.scroll + height - 1:
-            self.scroll = self.cursor - height + 2
+        crow = rows.index(("host", self.cursor))
+        self.scroll = min(self.scroll, crow)
+        if crow >= self.scroll + height - 1:
+            self.scroll = crow - height + 2
         self.scroll = max(0, self.scroll)
-        for i in range(self.scroll, min(len(self.shown), self.scroll + height)):
-            h = self.shown[i]
-            fav = h.name in self.favs
+        for r in range(self.scroll, min(len(rows), self.scroll + height)):
+            kind, ref = rows[r]
             line = Text()
-            line.append("★ " if fav else "  ", style="yellow" if fav else "dim")
-            line.append(f"{h.name:<24}", style="bold")
-            line.append(COL_SEP, style="dim")
-            _append_display(line, h)
-            if self.app.current_cat == ALL_CATEGORY:
+            if kind == "sep":
+                line.append("─" * max(1, self.size.width), style="dim")
+            elif kind == "hdr":
+                label = f" {ref} "
+                line.append(label,
+                            style="bold " + self.app.cat_colors.get(ref, ""))
+                line.append("─" * max(0, self.size.width - len(label)),
+                            style="dim")
+            else:
+                h = self.shown[ref]
+                fav = h.name in self.favs
+                line.append("★ " if fav else "  ",
+                            style="yellow" if fav else "dim")
+                line.append(f"{h.name:<32}", style="bold")
                 line.append(COL_SEP, style="dim")
-                line.append(f"[{h.category}]",
-                            style="bold " + self.app.cat_colors.get(
-                                h.category, ""))
-            if h.identityfile:
-                line.append(COL_SEP, style="dim")
-                line.append(f"[{Path(h.identityfile).expanduser().name}]",
-                            style="cyan dim")
-            if i == self.cursor:
-                line.stylize("reverse")
+                _append_display(line, h)
+                if h.identityfile:
+                    line.append(COL_SEP, style="dim")
+                    line.append(f"[{Path(h.identityfile).expanduser().name}]",
+                                style="cyan dim")
+                if ref == self.cursor:
+                    line.stylize("reverse")
             t.append_text(line)
             t.append("\n")
         return t
@@ -804,6 +894,71 @@ class SSHWiz(App):
             event.stop()
 
 
+# ----------------------------------------------------------- completion
+
+# Flags offered for '-...' prefixes (single source of truth; the completion
+# scripts only encode argument positions).
+CLI_FLAGS = ("-l", "--list", "-f", "-p", "--password", "-t", "--tmux",
+             "--complete", "--completion", "-h", "--help")
+
+
+def complete_candidates(prefix: str) -> list:
+    """Completion candidates for prefix: flags (prefix match) if it starts
+    with '-', otherwise host names (fuzzy, like the TUI filter)."""
+    p = prefix.lower()
+    if prefix.startswith("-"):
+        return [f for f in CLI_FLAGS if f.startswith(p)]
+    return [h.name for h in build_hosts() if fuzzy_match(p, h.name.lower())]
+
+
+COMPLETION_SCRIPTS = {
+    "bash": r"""# ssh-wiz bash completion — enable in .bashrc with:
+#   eval "$(ssh-wiz --completion bash)"
+__ssh_wiz() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local hostpos=0
+    COMPREPLY=()
+    [[ "$COMP_CWORD" -eq 1 ]] && hostpos=1
+    case "$prev" in -f|-p|-t) hostpos=1 ;; esac
+    if [[ "$cur" == -* || "$hostpos" -eq 1 ]]; then
+        local IFS=$'\n'
+        COMPREPLY=( $(ssh-wiz --complete "$cur" 2>/dev/null) )
+    fi
+    # remote-command position: default (filename) completion applies
+}
+complete -o default -F __ssh_wiz ssh-wiz""",
+    "zsh": r"""# ssh-wiz zsh completion — enable in .zshrc with:
+#   eval "$(ssh-wiz --completion zsh)"
+__ssh_wiz() {
+    local cur="${words[CURRENT]}"
+    local prev="${words[CURRENT-1]}"
+    reply=()
+    if [[ "$cur" == -* || "$CURRENT" -eq 2 || "$prev" == (-f -p -t) ]]; then
+        local -a cands
+        cands=("${(@f)$(ssh-wiz --complete "$cur" 2>/dev/null)}")
+        (( ${#cands} )) && reply=($cands)
+    else
+        _files
+    fi
+}
+(( $+functions[compdef] )) && compdef __ssh_wiz ssh-wiz""",
+    "fish": r"""# ssh-wiz fish completion — enable in config.fish with:
+#   ssh-wiz --completion fish | source
+complete -c ssh-wiz -s l -l list -d 'list hosts (ranked), no TUI'
+complete -c ssh-wiz -s f -r -d 'toggle favorite (takes host)'
+complete -c ssh-wiz -s p -l password -d 'connect with -o PubkeyAuthentication=no'
+complete -c ssh-wiz -s t -l tmux -d 'connect in per-host tmux session'
+complete -c ssh-wiz -s h -l help -d 'show help'
+complete -c ssh-wiz -l complete -d 'print hosts/flags matching prefix (completion backend)'
+complete -c ssh-wiz -l completion -d 'print completion script (bash, zsh or fish)'
+# fish filters the candidate list by the typed prefix itself
+complete -c ssh-wiz -n '__fish_is_first_token' -a '(ssh-wiz --complete "")' -d 'host'
+complete -c ssh-wiz -n '__fish_seen_argument -s f -s p -s t' -a '(ssh-wiz --complete "")' -d 'host'
+""",
+}
+
+
 # ------------------------------------------------------------------ CLI
 
 def main() -> None:
@@ -814,6 +969,19 @@ def main() -> None:
     if args[0] in ("-h", "--help"):
         print(__doc__.strip())
         return
+    if args[0] == "--complete":
+        prefix = args[1] if len(args) > 1 else ""
+        for c in complete_candidates(prefix):
+            print(c)
+        return
+    if args[0] == "--completion":
+        shell = args[1] if len(args) > 1 else ""
+        script = COMPLETION_SCRIPTS.get(shell)
+        if script is None:
+            sys.exit(f"ssh-wiz: unknown completion shell: {shell} "
+                     f"(want bash, zsh or fish)")
+        print(script)
+        return
     if args[0] in ("-l", "--list"):
         rules = load_category_rules(CATEGORIES_FILE)
         hosts, favs = rank_hosts(build_hosts(rules))
@@ -823,7 +991,7 @@ def main() -> None:
             line = Text()
             line.append("★ " if h.name in favs else "  ",
                         style="bold yellow" if h.name in favs else "dim")
-            line.append(f"{h.name:<24}", style="bold")
+            line.append(f"{h.name:<32}", style="bold")
             line.append(COL_SEP, style="dim")
             _append_display(line, h)
             if h.category and h.category != OTHER_CATEGORY:

@@ -7,14 +7,15 @@ reads your `~/.ssh/config` and gets you connected.
 - Ranking: favorites first, then most-recently-used (usage decays
   exponentially, 7-day time constant)
 - Per-host tmux sessions, password mode, ad-hoc `user@host` connects
+- Fuzzy shell completion for bash, zsh and fish
 - Single file, no build step
 
 ## Install
 
-Python 3.10+ with:
+Python 3.9+ with:
 
 ```sh
-pip install textual rich
+pip install "textual>=8.2.0" "rich>=13.0.0"
 ```
 
 Put `ssh-wiz` on your `PATH` (it is a single executable script).
@@ -29,6 +30,8 @@ ssh-wiz <host> cmd   connect and run cmd (and args) on the host
 ssh-wiz -p <host>    connect with -o PubkeyAuthentication=no
 ssh-wiz -t <host>    connect inside a per-host tmux session (wiz-<host>)
 ssh-wiz -f <host>    toggle favorite
+ssh-wiz --complete <prefix>   print hosts/flags matching prefix (completion)
+ssh-wiz --completion <shell>  print completion script (bash, zsh or fish)
 ssh-wiz -h           this help
 ```
 
@@ -50,9 +53,26 @@ ssh-wiz -h           this help
 | esc | clear filter / cancel ad-hoc |
 | ^q / ^c | quit |
 
+### Shell completion
+
+Host names complete with the same fuzzy matching as the TUI
+(`rzn9` → `ryzen9`); flags complete by prefix. Add to your shell rc:
+
+```sh
+# bash
+eval "$(ssh-wiz --completion bash)"
+
+# zsh
+eval "$(ssh-wiz --completion zsh)"
+
+# fish
+ssh-wiz --completion fish | source
+```
+
 ## Configuration
 
-All files are optional; create them as needed.
+Hosts are read from `~/.ssh/config` (or `$SSH_CONFIG` if set).
+The files below are optional; create them as needed.
 
 ### `~/.config/ssh-wiz/hosts` — extra hosts
 
