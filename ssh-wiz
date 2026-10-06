@@ -630,12 +630,21 @@ def _sh_quote(s: str) -> str:
 
 def _rsync_ssh_shell(host: Host, options: list | None = None) -> str:
     """The `-e` shell rsync uses to reach the host: ssh with the same
-    port/identityfile/options ssh would (ssh's port flag is -p, lowercase)."""
+    port/identityfile/options ssh would (ssh's port flag is -p, lowercase).
+    ControlMaster multiplexes every sync-screen connection (listing,
+    version probe, delete, transfer) over one SSH socket: the first
+    operation pays the handshake, the rest reuse the master, which lingers
+    60 s (ControlPersist) so consecutive directory hops stay fast. The
+    ControlPath uses %C (a hash) so long user/host names cannot exceed the
+    unix socket path limit."""
     parts = ["ssh"]
     if host.cmd_port:
         parts += ["-p", host.cmd_port]
     if host.identityfile:
         parts += ["-i", os.path.expanduser(host.identityfile)]
+    parts += ["-o", "ControlMaster=auto",
+              "-o", "ControlPath=%t/ssh-wiz-%C",
+              "-o", "ControlPersist=60"]
     for opt in options or []:
         parts += ["-o", opt]
     if host.extra:
@@ -1519,8 +1528,8 @@ class FileSyncScreen(Screen):
                         self._speed = speed
                         if xfr is not None:
                             done = xfr
-                        self._render_sync_status(items, done, total,
-                                                 "transferring…", None)
+                            self._render_sync_status(items, done, total,
+                                                     "transferring…", None)
 
         try:
             # LC_ALL=C: stable number format in progress samples (some

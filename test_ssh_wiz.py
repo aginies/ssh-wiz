@@ -1020,9 +1020,9 @@ class BuildTransferCmdTest(unittest.TestCase):
         self.assertEqual(cmd[0], "rsync")
         for flag in ("-a", "-z", "-h", "-i"):
             self.assertIn(flag, cmd)
-        # -e shell is ssh (no port/identity here)
+        # -e shell is ssh (no port/identity here; ControlMaster opts aside)
         e_i = cmd.index("-e")
-        self.assertEqual(cmd[e_i + 1], "ssh")
+        self.assertTrue(cmd[e_i + 1].startswith("ssh "))
         self.assertIn("/tmp/a.txt", cmd)
         self.assertIn("alice@foo:~/", cmd[-1])
 
@@ -1047,6 +1047,14 @@ class BuildTransferCmdTest(unittest.TestCase):
             up = shw.build_transfer_cmd(h, [], "up", [src], "/remote")
             self.assertTrue(up[-1].endswith("/remote/"))
             self.assertIn(src, up)  # source keeps no trailing slash
+
+    def test_shell_reuses_one_ssh_connection(self):
+        # ControlMaster multiplexes listing/probe/delete/transfer over one
+        # socket; ControlPersist keeps it warm between operations
+        shell = shw._rsync_ssh_shell(self.make_host())
+        self.assertIn("-o ControlMaster=auto", shell)
+        self.assertIn("ControlPath=", shell)
+        self.assertIn("ControlPersist=60", shell)
 
     def test_download_direction_swaps_operands(self):
         h = self.make_host()
@@ -1457,11 +1465,12 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
         self.assertFalse(victim.exists())
 
-    def _remote_roundtrip(self, cmd: list, home: str):
+    def _remote_roundtrip(self, cmd: list, home: str, host: str = "foo"):
         """Simulate the ssh round-trip for a delete command: the client joins
         the remote words with plain spaces, the remote login shell parses the
-        result with -c. Runs it for real against a temp dir as $HOME."""
-        remote_cmd = " ".join(cmd[2:])  # ssh <host> <remote words...>
+        result with -c. Runs it for real against a temp dir as $HOME.
+        `host` locates the remote command (ssh options precede it)."""
+        remote_cmd = " ".join(cmd[cmd.index(host) + 1:])  # ssh [opts] <host> <remote words...>
         # check=False on purpose: the tests assert on r.returncode/r.stderr
         return subprocess.run(
             ["sh", "-c", remote_cmd],
@@ -1509,7 +1518,7 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ssh_calls, "expected an ssh delete command")
         cmd = ssh_calls[0]
         # a leading ~ must be sent as $HOME so the remote shell expands it
-        remote_cmd = " ".join(cmd[2:])
+        remote_cmd = " ".join(cmd[cmd.index("foo") + 1:])
         self.assertIn("$HOME", remote_cmd)
         r = self._remote_roundtrip(cmd, workdir)
         self.assertEqual(r.returncode, 0, r.stderr)
