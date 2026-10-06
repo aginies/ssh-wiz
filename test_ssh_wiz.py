@@ -284,6 +284,48 @@ class TriageHostsTest(unittest.TestCase):
         self.assertEqual(shw.triage_hosts([], set(), [shw.ALL_CATEGORY]), [])
 
 
+class RankHostsTest(TempPathsTestCase):
+    def make(self, name, cat=shw.OTHER_CATEGORY, label=""):
+        return shw.Host(name=name, display=name, target=name,
+                        category=cat, label=label)
+
+    def test_alphabetic_by_first_column(self):
+        # non-alphabetic input order is sorted by the first column
+        hosts = [
+            self.make("zeta", "LAN"),
+            self.make("alpha", "LAN"),
+            self.make("mid", "WORK"),
+            self.make("beta", "WORK"),
+        ]
+        out, _favs = shw.rank_hosts(hosts)
+        self.assertEqual([h.name for h in out],
+                         ["alpha", "beta", "mid", "zeta"])
+
+    def test_multi_user_grouped_by_label(self):
+        # every user of a host stays adjacent (same label); the plain
+        # entry comes before the "(user)" variants
+        hosts = [
+            self.make("zeta (bob)", "LAN", label="zeta"),
+            self.make("alpha", "LAN"),
+            self.make("zeta", "LAN", label="zeta"),
+            self.make("beta", "WORK"),
+        ]
+        out, _favs = shw.rank_hosts(hosts)
+        self.assertEqual([h.name for h in out],
+                         ["alpha", "beta", "zeta", "zeta (bob)"])
+
+    def test_favorites_pinned_first(self):
+        self.favorites.write_text("mid\n")
+        hosts = [
+            self.make("zeta", "LAN"),
+            self.make("alpha", "LAN"),
+            self.make("mid", "WORK"),
+        ]
+        out, favs = shw.rank_hosts(hosts)
+        self.assertEqual(favs, {"mid"})
+        self.assertEqual([h.name for h in out], ["mid", "alpha", "zeta"])
+
+
 class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
     def write_hosts(self):
         self.ssh_config.write_text(
@@ -434,20 +476,19 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(80, 24)) as pilot:
                 cl = app.query_one(shw.CmdLine)
                 lines = str(cl.render()).splitlines()
-                self.assertEqual(lines[0], "─" * 80)
-                self.assertIn("ssh alpha", lines[1])
-                self.assertEqual(lines[2], "─" * 80)
+                self.assertIn("ssh alpha", lines[0])
+                self.assertEqual(lines[1], "─" * 80)
                 await pilot.press("down")
                 lines = str(cl.render()).splitlines()
-                self.assertIn("ssh beta", lines[1])
+                self.assertIn("ssh beta", lines[0])
                 await pilot.press("ctrl+o")
                 await pilot.press("right")  # no-pubkey on
                 await pilot.press("escape")
                 await pilot.press("ctrl+t")  # tmux mode
                 lines = str(cl.render()).splitlines()
-                self.assertIn("-o PubkeyAuthentication=no", lines[1])
-                self.assertIn("-t", lines[1])
-                self.assertIn("tmux new -A -s wiz-beta", lines[1])
+                self.assertIn("-o PubkeyAuthentication=no", lines[0])
+                self.assertIn("-t", lines[0])
+                self.assertIn("tmux new -A -s wiz-beta", lines[0])
 
     async def test_cmdline_wraps_long_command(self):
         self.ssh_config.write_text("")
@@ -466,8 +507,17 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 # 109-char command wraps: nothing clipped, tmux suffix visible
                 self.assertIn("ssh -t -o PubkeyAuthentication=no", text)
                 self.assertIn("tmux new -A -s wiz-box", text)
-                # the widget grew from 3 rows to 4 (wrapped command)
-                self.assertEqual(cl.region.height, 4)
+                # the widget grew from 2 rows to 3 (wrapped command)
+                self.assertEqual(cl.region.height, 3)
+
+    async def test_lines_below_tabs_and_options(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(80, 24)):
+            tabs = app.query_one("#tabs", shw.Static).styles.border_bottom
+            panel = app.query_one(shw.OptionsPanel).styles.border_bottom
+            self.assertEqual(tabs[0], "heavy")
+            self.assertEqual(panel[0], "heavy")
 
     async def test_help_overlay(self):
         self.ssh_config.write_text("Host alpha\n  User alice\n")

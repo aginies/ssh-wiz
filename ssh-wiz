@@ -9,7 +9,7 @@ Usage:
   ssh-wiz              launch the interactive picker
   ssh-wiz --demo       launch the picker with built-in sample data
                        (fake hosts/categories, no real connections)
-  ssh-wiz -l           list hosts (ranked), no TUI
+  ssh-wiz -l           list hosts (favorites first, A→Z), no TUI
   ssh-wiz <host>       connect directly, no TUI
   ssh-wiz <host> cmd   connect and run cmd (and args) on the host
   ssh-wiz -p <host>    connect directly with -o PubkeyAuthentication=no
@@ -473,13 +473,14 @@ def _append_display(line: Text, h: Host) -> None:
 
 
 def rank_hosts(hosts: list[Host]) -> tuple[list[Host], set]:
+    """Favorites first, then alphabetical by the first column (label or
+    name) so every category group reads A→Z; triage_hosts re-groups the
+    non-favorites per category for the ALL view, preserving this order."""
     favs = set(load_favorites())
-    usage = load_usage()
-    now = time.time()
 
     def sort_key(h):
         return (0 if h.name in favs else 1,
-                -usage_score(usage, h.name, now),
+                (h.label or h.name).lower(),
                 h.name.lower())
 
     return sorted(hosts, key=sort_key), favs
@@ -661,11 +662,11 @@ from textual.widgets import Static  # noqa: E402
 
 def hints_text() -> str:
     """Bottom-bar key hints; ^t is only shown when tmux is installed."""
-    parts = ["type: filter", "←→: cat", "↑↓: select", "⏎: connect",
+    parts = ["?/F1: help", "type: filter", "⏎: connect",
              "^f: fav", "^o: opts"]
     if tmux_available():
         parts.append("^t: tmux")
-    parts += ["^y: copy", "^e: edit", "^g: cats", "?/F1: help",
+    parts += ["^y: copy", "^e: edit", "^g: cats",
               "esc: clear", "^q: quit"]
     return "    ".join(parts)
 
@@ -833,6 +834,7 @@ class OptionsPanel(Widget):
         background: $surface;
         display: none;
         padding: 0 1;
+        border-bottom: heavy $border;
     }
     """
 
@@ -862,14 +864,15 @@ class OptionsPanel(Widget):
 
 class CmdLine(Widget):
     """The final ssh command for the selected host, drawn below the
-    category tabs (options panel when open) between two dim separator
-    lines. Shows exactly what enter / ^y will run; long commands wrap
-    to a second line instead of being clipped."""
+    category tabs (options panel when open), with a dim separator line
+    underneath; the line above the command is the tabs/options border.
+    Shows exactly what enter / ^y will run; long commands wrap to a
+    second line instead of being clipped."""
     DEFAULT_CSS = """
     CmdLine {
         width: 100%;
         height: auto;
-        min-height: 3;
+        min-height: 2;
         background: $surface;
     }
     """
@@ -878,8 +881,6 @@ class CmdLine(Widget):
         app = self.app
         hl = app.query_one(HostList)
         t = Text(end="")
-        t.append("─" * max(1, self.size.width), style="dim")
-        t.append("\n")
         if hl.shown:
             host = hl.shown[hl.cursor]
             cmd = " ".join(
@@ -906,10 +907,11 @@ class SSHWiz(App):
         padding: 0 1;
     }
     #tabs {
-        height: 1;
+        height: 2;
         background: $surface;
         color: $text;
         padding: 0 1;
+        border-bottom: heavy $border;
     }
     #hints {
         height: 1;
@@ -1039,7 +1041,7 @@ class SSHWiz(App):
             cmd = " ".join(
                 build_ssh_cmd(host, self.enabled_options(), self.tmux_mode))
             self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
-            record_use(host.name)  # demo state only: shows the ranking
+            record_use(host.name)  # demo state only: usage.json grows on connect
             self.reload()
             hl = self.query_one(HostList)
             for i, h in enumerate(hl.shown):
@@ -1349,7 +1351,7 @@ __ssh_wiz() {
 (( $+functions[compdef] )) && compdef __ssh_wiz ssh-wiz""",
     "fish": r"""# ssh-wiz fish completion — enable in config.fish with:
 #   ssh-wiz --completion fish | source
-complete -c ssh-wiz -s l -l list -d 'list hosts (ranked), no TUI'
+complete -c ssh-wiz -s l -l list -d 'list hosts (favorites first, A→Z), no TUI'
 complete -c ssh-wiz -s f -r -d 'toggle favorite (takes host)'
 complete -c ssh-wiz -s p -l password -d 'connect with -o PubkeyAuthentication=no'
 complete -c ssh-wiz -s t -l tmux -d 'connect in per-host tmux session'
@@ -1368,7 +1370,7 @@ complete -c ssh-wiz -n '__fish_seen_argument -s f -s p -s t' -a '(ssh-wiz --comp
 # Built-in sample data for --demo: obviously fake (RFC 2606 example.*
 # domains, TEST-NET-1 addresses), exercising every feature — categories,
 # multi-user hosts, GSSAPI principal, ports, identity files, extra hosts,
-# favorites, usage-based ranking and Tailscale auto-categorization.
+# favorites, alphabetical ordering and Tailscale auto-categorization.
 DEMO_SSH_CONFIG = """\
 Host web1.example.com 10.0.0.11
     Port 2222
