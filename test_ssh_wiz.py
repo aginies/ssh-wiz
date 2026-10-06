@@ -209,6 +209,20 @@ class BuildHostsTest(TempPathsTestCase):
         self.assertEqual(hosts["v4"].host, "10.0.1.5")
         self.assertEqual(hosts["v4"].port, "99")
 
+    def test_tailscale_auto_category(self):
+        self.ssh_config.write_text("Host 100.64.9.9\nHost 10.0.1.5\n")
+        self.extra_hosts.write_text("tsbox  carol@100.90.1.2\n")
+        hosts = {h.name: h for h in shw.build_hosts()}
+        self.assertEqual(hosts["100.64.9.9"].category, "TAILSCALE")
+        self.assertEqual(hosts["tsbox"].category, "TAILSCALE")
+        self.assertEqual(hosts["10.0.1.5"].category, shw.OTHER_CATEGORY)
+
+    def test_tailscale_rule_overrides_builtin(self):
+        self.ssh_config.write_text("Host 100.87.36.78\n")
+        self.categories.write_text("LAN  100.87.*\n")
+        hosts = {h.name: h for h in shw.build_hosts()}
+        self.assertEqual(hosts["100.87.36.78"].category, "LAN")
+
 
 class FavoriteSplitTest(unittest.TestCase):
     def make(self, names):
@@ -386,13 +400,45 @@ class MiscTest(TempPathsTestCase):
         self.assertFalse(shw.fuzzy_match("9znr", "ryzen9"))
         self.assertTrue(shw.fuzzy_match("", "anything"))
 
-    def test_categorize_case_sensitive(self):
+    def test_host_category_case_sensitive(self):
         rules = [("LAN", "10.0.1.*", None)]
-        self.assertEqual(shw.categorize("10.0.1.5", rules), "LAN")
-        self.assertEqual(shw.categorize("zzz", rules), shw.OTHER_CATEGORY)
+        self.assertEqual(shw.host_category("10.0.1.5", rules), "LAN")
+        self.assertEqual(shw.host_category("zzz", rules), shw.OTHER_CATEGORY)
         self.assertEqual(
-            shw.categorize("lan", [("Lan", "LAN*", None)]), shw.OTHER_CATEGORY
+            shw.host_category("lan", [("Lan", "LAN*", None)]), shw.OTHER_CATEGORY
         )
+
+    def test_range_category_boundaries(self):
+        self.assertEqual(shw.range_category("100.64.0.0"), "TAILSCALE")
+        self.assertEqual(shw.range_category("100.127.255.255"), "TAILSCALE")
+        self.assertIsNone(shw.range_category("100.63.255.255"))
+        self.assertIsNone(shw.range_category("100.128.0.0"))
+        self.assertIsNone(shw.range_category("not-an-ip"))
+        self.assertIsNone(shw.range_category("100.64.1.2:2222"))  # not bare IP
+
+    def test_host_category_builtin_ranges(self):
+        # no rule matches: name or target_host in the range -> TAILSCALE
+        self.assertEqual(shw.host_category("100.87.36.78", []), "TAILSCALE")
+        self.assertEqual(shw.host_category("buildbox", [], "100.64.5.5"), "TAILSCALE")
+        # user rules win over built-in ranges
+        rules = [("LAN", "100.87.*", None)]
+        self.assertEqual(shw.host_category("100.87.36.78", rules), "LAN")
+        # nothing matches -> OTHER
+        self.assertEqual(
+            shw.host_category("buildbox", [], "192.0.2.5"), shw.OTHER_CATEGORY
+        )
+
+    def test_category_order_includes_builtin(self):
+        hosts = [
+            shw.Host(name="a", display="a", target="a", category="TAILSCALE"),
+            shw.Host(name="b", display="b", target="b", category=shw.OTHER_CATEGORY),
+        ]
+        self.assertEqual(
+            shw.category_order(hosts, []),
+            ["ALL", "TAILSCALE", shw.OTHER_CATEGORY],
+        )
+        colors = shw.category_colors(hosts, [])
+        self.assertEqual(colors["TAILSCALE"], "#32bea6")
 
     def test_user_color_stable(self):
         self.assertEqual(shw.user_color("root"), shw.user_color("root"))
@@ -472,6 +518,61 @@ class SshConfigPathTest(unittest.TestCase):
         env.pop("SSH_CONFIG", None)
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(shw._ssh_config_path(), Path.home() / ".ssh" / "config")
+
+
+class DemoTest(TempPathsTestCase):
+    def run_main(self, *argv):
+        old = sys.argv
+        sys.argv = ["ssh-wiz", *argv]
+        try:
+            shw.main()
+        finally:
+            sys.argv = old
+
+    def test_start_and_stop_roundtrip(self):
+        root = shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        self.assertTrue(shw.DEMO)
+        self.assertTrue(shw.SSH_CONFIG.is_file())
+        self.assertIn("web1.example.com", shw.SSH_CONFIG.read_text())
+        for f in (
+            shw.CATEGORIES_FILE,
+            shw.FAVORITES_FILE,
+            shw.USAGE_FILE,
+            shw.EXTRA_HOSTS_FILE,
+        ):
+            self.assertTrue(f.is_file())
+        shw.stop_demo()
+        self.assertFalse(shw.DEMO)
+        self.assertFalse(root.exists())
+        self.assertEqual(shw.SSH_CONFIG, self.ssh_config)
+
+    def test_demo_list_uses_fake_data(self):
+        self.ssh_config.write_text("Host realmarker\n  User zed\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--demo", "-l")
+        text = out.getvalue()
+        self.assertIn("web1.example.com", text)
+        self.assertIn("alice@web1.example.com", text)
+        self.assertIn("bob@web1.example.com", text)  # multi-user entry
+        self.assertIn("buildbox", text)  # extra host
+        self.assertNotIn("realmarker", text)  # real config untouched
+
+
+class DemoTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
+    async def test_demo_connect_shows_command_not_ssh(self):
+        shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        app = shw.SSHWiz()
+        with (
+            mock.patch.object(shw.subprocess, "run") as run,
+            mock.patch.object(shw.SSHWiz, "notify") as notify,
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("enter")
+            run.assert_not_called()  # no real ssh in demo mode
+        self.assertTrue(any("would run: ssh" in str(c) for c in notify.call_args))
 
 
 class CliTest(TempPathsTestCase):

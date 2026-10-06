@@ -7,6 +7,8 @@ Favorites and most-recently-used hosts are kept at the top.
 
 Usage:
   ssh-wiz              launch the interactive picker
+  ssh-wiz --demo       launch the picker with built-in sample data
+                       (fake hosts/categories, no real connections)
   ssh-wiz -l           list hosts (ranked), no TUI
   ssh-wiz <host>       connect directly, no TUI
   ssh-wiz <host> cmd   connect and run cmd (and args) on the host
@@ -35,6 +37,7 @@ TUI keys:
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import json
 import math
 import os
@@ -43,6 +46,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass
@@ -69,8 +73,25 @@ FAVORITES_FILE = CONFIG_DIR / "favorites"
 USAGE_FILE = STATE_DIR / "usage.json"
 EXTRA_HOSTS_FILE = CONFIG_DIR / "hosts"
 CATEGORIES_FILE = CONFIG_DIR / "categories"
+# --demo: all data files are pointed at a temp dir with sample data
+# (start_demo/stop_demo); the real config and state are never touched.
+_PATH_ATTRS = ("SSH_CONFIG", "CONFIG_DIR", "STATE_DIR", "FAVORITES_FILE",
+               "USAGE_FILE", "EXTRA_HOSTS_FILE", "CATEGORIES_FILE")
+DEMO = False      # demo mode active: sample data, no real connections
+_demo_saved = None  # path values before start_demo (restored by stop_demo)
+_demo_root = None   # demo temp dir
 OTHER_CATEGORY = "OTHER"
 ALL_CATEGORY = "ALL"
+# Built-in IP ranges -> category (data, not code): checked after user
+# rules, before OTHER. Add a line to auto-categorize another range;
+# repeat the category name to union several CIDRs. Tabs, order and
+# colors all follow from this table (CIDR works for IPv4 and IPv6).
+BUILTIN_RANGES = (
+    # category     CIDR             tab color
+    ("TAILSCALE", "100.64.0.0/10", "#32bea6"),  # Tailscale CGNAT
+)
+_RANGE_NETS = tuple((cat, ipaddress.ip_network(cidr), color)
+                    for cat, cidr, color in BUILTIN_RANGES)
 CATEGORY_COLORS = ("green", "cyan", "magenta", "yellow", "blue", "red",
                    "bright_cyan", "bright_yellow")
 USER_COLORS = ("bright_red", "bright_green", "bright_yellow", "bright_blue",
@@ -119,10 +140,13 @@ def tmux_session_name(host: Host) -> str:
 
 
 def category_order(hosts: list[Host], rules: list) -> list:
-    """[ALL, <cats in file order>, OTHER (if any host falls there)]."""
+    """[ALL, <cats in file order>, <built-in cats with hosts>, OTHER]."""
     cats = [ALL_CATEGORY]
     for cat, _pattern, _color in rules:
         if cat not in cats:
+            cats.append(cat)
+    for cat, _cidr, _color in BUILTIN_RANGES:
+        if cat not in cats and any(h.category == cat for h in hosts):
             cats.append(cat)
     if any(h.category == OTHER_CATEGORY for h in hosts):
         cats.append(OTHER_CATEGORY)
@@ -137,6 +161,8 @@ def category_colors(hosts: list[Host], rules: list) -> dict:
     for cat, _pattern, color in rules:
         if color and cat not in colors:
             colors[cat] = color
+    for cat, _cidr, color in BUILTIN_RANGES:
+        colors.setdefault(cat, color)
     for i, cat in enumerate(cats):
         if cat in (ALL_CATEGORY, OTHER_CATEGORY) or cat in colors:
             continue
@@ -310,10 +336,33 @@ def load_category_rules(path: Path) -> list:
     return rules
 
 
-def categorize(name: str, rules: list) -> str:
+def range_category(s: str) -> str | None:
+    """Built-in category (BUILTIN_RANGES) for a bare IP string, or None."""
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        return None
+    for cat, net, _color in _RANGE_NETS:
+        if ip in net:
+            return cat
+    return None
+
+
+def host_category(name: str, rules: list, target_host: str | None = None) -> str:
+    """Category for a host, given all the info we have about it.
+
+    name        — what user rules match (config name / extra alias)
+    target_host — the ssh target's host part (extra hosts only)
+    Precedence: first matching user rule > built-in IP ranges > OTHER.
+    """
     for cat, pattern, _color in rules:
         if fnmatch.fnmatchcase(name, pattern):
             return cat
+    for s in (name, target_host):
+        if s:
+            cat = range_category(s)
+            if cat:
+                return cat
     return OTHER_CATEGORY
 
 
@@ -339,7 +388,7 @@ def build_hosts(rules: list | None = None) -> list[Host]:
                     name=entry, display=display, target=target, label=name,
                     user=None, host=name, port=port, principal=user,
                     identityfile=h["identityfile"],
-                    category=categorize(name, rules),
+                    category=host_category(name, rules),
                 ))
             else:
                 display = f"{user}@{name}" + (f":{port}" if port and port != "22" else "")
@@ -347,7 +396,7 @@ def build_hosts(rules: list | None = None) -> list[Host]:
                     name=entry, display=display, target=target, label=name,
                     user=user, host=name, port=port,
                     identityfile=h["identityfile"],
-                    category=categorize(name, rules),
+                    category=host_category(name, rules),
                 ))
     for e in parse_extra_hosts(EXTRA_HOSTS_FILE):
         if any(h.name == e["name"] for h in hosts):
@@ -371,7 +420,7 @@ def build_hosts(rules: list | None = None) -> list[Host]:
             user=user, host=hostpart, port=port or None,
             cmd_port=port or None,
             extra=e["extra"],
-            category=categorize(e["name"], rules),
+            category=host_category(e["name"], rules, hostpart),
         ))
     return hosts
 
@@ -695,6 +744,9 @@ class SSHWiz(App):
     def update_status(self) -> None:
         hl = self.query_one(HostList)
         parts = []
+        if DEMO:
+            parts.append("[bold magenta]DEMO MODE[/] (sample data — "
+                         "no real connections)")
         if self.password_mode:
             parts.append("[bold red]PASSWORD MODE[/] (-o PubkeyAuthentication=no)")
         if self.tmux_mode:
@@ -705,6 +757,8 @@ class SSHWiz(App):
         self.query_one("#status", Static).update("   ".join(parts))
 
     def on_mount(self) -> None:
+        if DEMO:
+            self.title = "ssh-wiz (demo)"
         self.reload()
         self.query_one(HostList).focus()
 
@@ -727,6 +781,19 @@ class SSHWiz(App):
 
     def connect_to(self, host: Host) -> None:
         if self.connecting:
+            return
+        if DEMO:
+            cmd = " ".join(
+                build_ssh_cmd(host, self.password_mode, self.tmux_mode))
+            self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
+            record_use(host.name)  # demo state only: shows the ranking
+            self.reload()
+            hl = self.query_one(HostList)
+            for i, h in enumerate(hl.shown):
+                if h.name == host.name:
+                    hl.cursor = i
+                    break
+            hl.refresh()
             return
         cmd = build_ssh_cmd(host, self.password_mode, self.tmux_mode)
         self.connecting = True
@@ -760,6 +827,10 @@ class SSHWiz(App):
         self.connect_to(hl.shown[hl.cursor])
 
     def edit_config(self) -> None:
+        if DEMO:
+            self.notify("demo mode — no real config to edit",
+                        severity="warning")
+            return
         hl = self.query_one(HostList)
         if not hl.shown:
             return
@@ -881,7 +952,8 @@ class SSHWiz(App):
 # Flags offered for '-...' prefixes (single source of truth; the completion
 # scripts only encode argument positions).
 CLI_FLAGS = ("-l", "--list", "-f", "-p", "--password", "-t", "--tmux",
-             "--complete", "--completion", "-h", "--help", "-V", "--version")
+             "--demo", "--complete", "--completion",
+             "-h", "--help", "-V", "--version")
 
 
 def complete_candidates(prefix: str) -> list:
@@ -941,10 +1013,131 @@ complete -c ssh-wiz -n '__fish_seen_argument -s f -s p -s t' -a '(ssh-wiz --comp
 }
 
 
+# ------------------------------------------------------------------ demo
+
+# Built-in sample data for --demo: obviously fake (RFC 2606 example.*
+# domains, TEST-NET-1 addresses), exercising every feature — categories,
+# multi-user hosts, GSSAPI principal, ports, identity files, extra hosts,
+# favorites and usage-based ranking.
+DEMO_SSH_CONFIG = """\
+Host web1.example.com 10.0.0.11
+    Port 2222
+    User alice
+    IdentityFile ~/.ssh/id_ed25519
+
+Host web1.example.com
+    User bob
+
+Host web2.example.com
+    Port 2222
+    User alice
+
+Host db1.example.com
+    Port 5432
+    User postgres
+    IdentityFile ~/.ssh/id_rsa
+
+Host db1.example.com
+    User root
+
+Host cache1.example.com
+    User redis
+
+Host git.example.org
+    User git
+
+Host kerberos.example.org
+    User alice@EXAMPLE.ORG
+
+Host bastion.example.net
+    Port 2222
+    User root
+    IdentityFile ~/.ssh/id_rsa
+"""
+
+DEMO_EXTRA_HOSTS = """\
+# name  user@host[:port]  [extra ssh args]
+buildbox  carol@192.0.2.5:8022
+metrics   dave@metrics.example.net
+staging   erin@staging.example.net:9022  -o LogLevel=ERROR
+oldbox    frank@192.0.2.99
+"""
+
+DEMO_CATEGORIES = """\
+PROD   *.example.com    green
+LAN    10.0.0.*    magenta
+LAN    192.0.2.*
+DEV    *.example.org
+CLOUD  *.example.net    cyan
+"""
+
+
+def start_demo() -> Path:
+    """Point all data files at a temp dir with built-in sample data.
+
+    The real config and state are left untouched; stop_demo() restores
+    the original paths and removes the temp dir.
+    """
+    global DEMO, _demo_saved, _demo_root
+    global SSH_CONFIG, CONFIG_DIR, STATE_DIR
+    global FAVORITES_FILE, USAGE_FILE, EXTRA_HOSTS_FILE, CATEGORIES_FILE
+    root = Path(tempfile.mkdtemp(prefix="ssh-wiz-demo-"))
+    _demo_saved = {a: globals()[a] for a in _PATH_ATTRS}
+    _demo_root = root
+    CONFIG_DIR = root / "config"
+    STATE_DIR = root / "state"
+    CONFIG_DIR.mkdir(parents=True)
+    STATE_DIR.mkdir(parents=True)
+    SSH_CONFIG = root / "ssh_config"
+    FAVORITES_FILE = CONFIG_DIR / "favorites"
+    USAGE_FILE = STATE_DIR / "usage.json"
+    EXTRA_HOSTS_FILE = CONFIG_DIR / "hosts"
+    CATEGORIES_FILE = CONFIG_DIR / "categories"
+    SSH_CONFIG.write_text(DEMO_SSH_CONFIG)
+    EXTRA_HOSTS_FILE.write_text(DEMO_EXTRA_HOSTS)
+    CATEGORIES_FILE.write_text(DEMO_CATEGORIES)
+    FAVORITES_FILE.write_text("web1.example.com\ngit.example.org\n")
+    now = time.time()
+    USAGE_FILE.write_text(json.dumps({
+        "web1.example.com": [now - 86400],
+        "db1.example.com": [now - 3600],
+        "git.example.org": [now - 60],
+        "web2.example.com": [now - 1800, now - 7200],
+        "bastion.example.net": [now - 43200],
+    }))
+    DEMO = True
+    return root
+
+
+def stop_demo() -> None:
+    """Restore the real data paths and remove the demo temp dir."""
+    global DEMO, _demo_saved, _demo_root
+    if _demo_saved is None:
+        return
+    for name, value in _demo_saved.items():
+        globals()[name] = value
+    DEMO = False
+    shutil.rmtree(_demo_root, ignore_errors=True)
+    _demo_saved = None
+    _demo_root = None
+
+
 # ------------------------------------------------------------------ CLI
 
 def main() -> None:
     args = sys.argv[1:]
+    demo = "--demo" in args
+    if demo:
+        args = [a for a in args if a != "--demo"]
+        start_demo()
+    try:
+        run_main(args)
+    finally:
+        if demo:
+            stop_demo()
+
+
+def run_main(args: list) -> None:
     if not args:
         SSHWiz().run()
         return
