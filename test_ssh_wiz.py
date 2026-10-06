@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1098,6 +1099,42 @@ class BuildTransferCmdTest(unittest.TestCase):
         self.assertTrue(cmd[-1].endswith("/tmp/out/"))
         # remote source comes before local dest
         self.assertLess(cmd.index("alice@foo:data/file.txt"), cmd.index("/tmp/out/"))
+
+
+class FileListFilteredTest(unittest.TestCase):
+    @staticmethod
+    def _entry(name):
+        return shw.FileEntry(name=name, path=f"/tmp/{name}")
+
+    def test_filtered_caches_and_invalidates(self):
+        lst = shw.FileList()
+        lst.entries = [self._entry(f"f{i}.txt") for i in range(100)]
+        first = lst.filtered
+        self.assertIs(lst.filtered, first)  # same inputs -> cached rows
+        lst.filter = "f1"
+        second = lst.filtered
+        self.assertIsNot(second, first)     # filter change invalidates
+        self.assertIs(lst.filtered, second)  # cached again
+        lst.filter = ""
+        lst.entries.append(self._entry("zzz.txt"))  # in-place mutation
+        self.assertIn("zzz.txt", [e.name for e in lst.filtered])
+        lst.show_hidden = True
+        self.assertIsNot(lst.filtered, second)  # show_hidden invalidates
+
+    def test_filtered_cache_hits_are_cheap(self):
+        # 10k entries: the fuzzy pass is ~5 ms; repeated reads within one
+        # key event must not re-run it
+        lst = shw.FileList()
+        lst.entries = [self._entry(f"f{i:05d}.txt") for i in range(10_000)]
+        lst.filter = "f0"
+        first = lst.filtered
+        t0 = time.perf_counter()
+        cached = None
+        for _ in range(20):
+            cached = lst.filtered
+        elapsed = time.perf_counter() - t0
+        self.assertIs(cached, first)
+        self.assertLess(elapsed, 0.005)  # 20 cache hits in < 5 ms
 
 
 class FileSyncParserTest(unittest.TestCase):
