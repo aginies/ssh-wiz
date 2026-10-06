@@ -900,9 +900,13 @@ class LazyTuiTest(unittest.TestCase):
             "assert 'textual' not in sys.modules\n"
         )
         # check=False on purpose: the test asserts on r.returncode/r.stderr
-        r = subprocess.run([sys.executable, "-c", code],
-                           capture_output=True, text=True, timeout=60,
-                           check=False)
+        r = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
 
 
@@ -1488,7 +1492,9 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         the remote words with plain spaces, the remote login shell parses the
         result with -c. Runs it for real against a temp dir as $HOME.
         `host` locates the remote command (ssh options precede it)."""
-        remote_cmd = " ".join(cmd[cmd.index(host) + 1:])  # ssh [opts] <host> <remote words...>
+        remote_cmd = " ".join(
+            cmd[cmd.index(host) + 1 :]
+        )  # ssh [opts] <host> <remote words...>
         # check=False on purpose: the tests assert on r.returncode/r.stderr
         return subprocess.run(
             ["sh", "-c", remote_cmd],
@@ -1536,7 +1542,7 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ssh_calls, "expected an ssh delete command")
         cmd = ssh_calls[0]
         # a leading ~ must be sent as $HOME so the remote shell expands it
-        remote_cmd = " ".join(cmd[cmd.index("foo") + 1:])
+        remote_cmd = " ".join(cmd[cmd.index("foo") + 1 :])
         self.assertIn("$HOME", remote_cmd)
         r = self._remote_roundtrip(cmd, workdir)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1858,8 +1864,9 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 app.screen.remote_rsync = None
                 local = app.screen.query_one("#local-list", shw.FileList)
                 local.entries = [
-                    shw.FileEntry(name=f"f{i:03d}.bin",
-                                  path=f"/tmp/f{i:03d}.bin", selected=True)
+                    shw.FileEntry(
+                        name=f"f{i:03d}.bin", path=f"/tmp/f{i:03d}.bin", selected=True
+                    )
                     for i in range(n)
                 ]
                 await pilot.press("f5")
@@ -1868,8 +1875,8 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 status = str(app.screen.query_one("#sync-status", shw.Static).render())
         self.assertIn(f"done  {n} file(s)", status)
         self.assertIn("earlier item(s) not shown", status)
-        self.assertIn("f119.bin", status)      # newest item still shown
-        self.assertNotIn("f000.bin", status)   # oldest dropped from display
+        self.assertIn("f119.bin", status)  # newest item still shown
+        self.assertNotIn("f000.bin", status)  # oldest dropped from display
 
     async def test_esc_during_transfer_asks_confirmation(self):
         self.write_hosts()
