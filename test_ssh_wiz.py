@@ -207,6 +207,15 @@ class BuildHostsTest(TempPathsTestCase):
         self.assertEqual(shw.find_host("ryzen9").target, "ryzen9")
         self.assertEqual(shw.find_host("ryzen9 (root)").target, "root@ryzen9")
 
+    def test_find_host_user_at_host_completion(self):
+        # completion inserts user@host; the first/default user's target is
+        # the bare host, so find_host must resolve it back
+        self.ssh_config.write_text(
+            "Host ryzen9\n  User llm\nHost ryzen9\n  User root\n"
+        )
+        self.assertEqual(shw.find_host("root@ryzen9").target, "root@ryzen9")
+        self.assertEqual(shw.find_host("llm@ryzen9").target, "ryzen9")
+
     def test_ipv6_and_bracketed_ports(self):
         self.extra_hosts.write_text("v6  ::1\nv6p  [::1]:8022\nv4  10.0.1.5:99\n")
         hosts = {h.name: h for h in shw.build_hosts()}
@@ -909,6 +918,25 @@ class CompletionTest(TempPathsTestCase):
         self.assertEqual(shw.complete_candidates("-z"), [])
         self.assertEqual(shw.complete_candidates("-"), list(shw.CLI_FLAGS))
 
+    def test_complete_pairs(self):
+        # only real user@host couples, in config order
+        self.assertEqual(shw.complete_pairs("alice", ""), ["alice@ryzen9"])
+        self.assertEqual(shw.complete_pairs("bob", ""), ["bob@web1"])
+        self.assertEqual(shw.complete_pairs("carol", ""), ["carol@example.org"])
+
+    def test_complete_pairs_prefix(self):
+        self.assertEqual(shw.complete_pairs("alice", "ryz"), ["alice@ryzen9"])
+        self.assertEqual(shw.complete_pairs("alice", "web"), [])
+
+    def test_complete_user_hosts_all(self):
+        self.assertEqual(
+            shw.complete_user_hosts(""),
+            ["alice@ryzen9", "bob@web1", "carol@example.org"],
+        )
+
+    def test_complete_user_hosts_prefix(self):
+        self.assertEqual(shw.complete_user_hosts("ryz"), ["alice@ryzen9"])
+
 
 class CompletionCliTest(TempPathsTestCase):
     def test_complete(self):
@@ -924,6 +952,20 @@ class CompletionCliTest(TempPathsTestCase):
         with contextlib.redirect_stdout(out):
             self.run_main("--complete")
         self.assertEqual(out.getvalue().splitlines(), ["a", "b"])
+
+    def test_complete_users(self):
+        self.ssh_config.write_text("Host ryzen9\n  User alice\nHost web1\n  User bob\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--complete-hosts")
+        self.assertEqual(out.getvalue().splitlines(), ["alice@ryzen9", "bob@web1"])
+
+    def test_complete_hosts_prefix(self):
+        self.ssh_config.write_text("Host ryzen9\n  User alice\nHost web1\n  User bob\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--complete-hosts", "ryz")
+        self.assertEqual(out.getvalue().splitlines(), ["alice@ryzen9"])
 
     def test_completion_scripts(self):
         markers = {

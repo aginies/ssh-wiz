@@ -17,6 +17,7 @@ Usage:
   ssh-wiz -t <host>    connect directly inside a per-host tmux session
   ssh-wiz -f <host>    toggle favorite
   ssh-wiz --complete <prefix>   print hosts/flags matching prefix (completion)
+  ssh-wiz --complete-hosts <prefix>  print user@host pairs matching prefix (completion)
   ssh-wiz --completion <shell>  print completion script (bash, zsh or fish)
   ssh-wiz --version    print the version
   ssh-wiz -h           this help
@@ -602,9 +603,17 @@ def build_ssh_cmd(host: Host, options: list | None = None,
 
 
 def find_host(name: str) -> Host:
-    for h in build_hosts():
+    hosts = build_hosts()
+    for h in hosts:
         if h.name == name or h.target == name:
             return h
+    # user@host completion where the user is the first/default user
+    # (whose target is the bare host name): resolve to the matching entry.
+    if "@" in name:
+        user, _, hostpart = name.partition("@")
+        for h in hosts:
+            if h.host == hostpart and (h.user == user or h.principal == user):
+                return h
     return Host(name=name, display=name, target=name)
 
 
@@ -1302,6 +1311,30 @@ CLI_FLAGS = ("-l", "--list", "-f", "-p", "--password", "-t", "--tmux",
              "-h", "--help", "-V", "--version")
 
 
+def complete_pairs(user: str, prefix: str) -> list:
+    """'user@host' working pairs for hosts that offer `user`, fuzzy-matched
+    by prefix. Only real USER@HOST couples are offered (never a user with a
+    host that does not have it). An empty `user` means "any user" — every
+    pair is returned."""
+    out = []
+    p = prefix.lower()
+    for h in build_hosts():
+        u = h.user if h.user is not None else h.principal
+        if u is None or (user and u != user) or h.host is None:
+            continue
+        cand = f"{h.user}@{h.host}" if h.user else h.name
+        if fuzzy_match(p, cand.lower()):
+            out.append(cand)
+    return out
+
+
+def complete_user_hosts(prefix: str) -> list:
+    """All working 'user@host' pairs, fuzzy-matched by prefix. This is what
+    the shell completion offers for the host argument, so a completion is a
+    single connectable token (never 'user' then 'user@host' as two args)."""
+    return complete_pairs("", prefix)
+
+
 def complete_candidates(prefix: str) -> list:
     """Completion candidates for prefix: flags (prefix match) if it starts
     with '-', otherwise host names (fuzzy, like the TUI filter)."""
@@ -1317,15 +1350,15 @@ COMPLETION_SCRIPTS = {
 __ssh_wiz() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
-    local hostpos=0
+    local IFS=$'\n'
     COMPREPLY=()
-    [[ "$COMP_CWORD" -eq 1 ]] && hostpos=1
-    case "$prev" in -f|-p|-t) hostpos=1 ;; esac
-    if [[ "$cur" == -* || "$hostpos" -eq 1 ]]; then
-        local IFS=$'\n'
+    # flags complete by prefix; the host argument completes as a single
+    # connectable 'user@host' token (never 'user' then 'user@host')
+    if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(ssh-wiz --complete "$cur" 2>/dev/null) )
+    elif [[ "$COMP_CWORD" -eq 1 || "$prev" == -f || "$prev" == -p || "$prev" == -t ]]; then
+        COMPREPLY=( $(ssh-wiz --complete-hosts "$cur" 2>/dev/null) )
     fi
-    # remote-command position: default (filename) completion applies
 }
 complete -o default -F __ssh_wiz ssh-wiz""",
     "zsh": r"""# ssh-wiz zsh completion — enable in .zshrc with:
@@ -1334,9 +1367,15 @@ __ssh_wiz() {
     local cur="${words[CURRENT]}"
     local prev="${words[CURRENT-1]}"
     reply=()
-    if [[ "$cur" == -* || "$CURRENT" -eq 2 || "$prev" == (-f -p -t) ]]; then
+    # flags complete by prefix; the host argument completes as a single
+    # connectable 'user@host' token (never 'user' then 'user@host')
+    if [[ "$cur" == -* ]]; then
         local -a cands
         cands=("${(@f)$(ssh-wiz --complete "$cur" 2>/dev/null)}")
+        (( ${#cands} )) && reply=($cands)
+    elif [[ "$CURRENT" -eq 2 || "$prev" == -f || "$prev" == -p || "$prev" == -t ]]; then
+        local -a cands
+        cands=("${(@f)$(ssh-wiz --complete-hosts "$cur" 2>/dev/null)}")
         (( ${#cands} )) && reply=($cands)
     else
         _files
@@ -1352,9 +1391,9 @@ complete -c ssh-wiz -s t -l tmux -d 'connect in per-host tmux session'
 complete -c ssh-wiz -s h -l help -d 'show help'
 complete -c ssh-wiz -l complete -d 'print hosts/flags matching prefix (completion backend)'
 complete -c ssh-wiz -l completion -d 'print completion script (bash, zsh or fish)'
-# fish filters the candidate list by the typed prefix itself
-complete -c ssh-wiz -n '__fish_is_first_token' -a '(ssh-wiz --complete "")' -d 'host'
-complete -c ssh-wiz -n '__fish_seen_argument -s f -s p -s t' -a '(ssh-wiz --complete "")' -d 'host'
+# the host argument completes as a single connectable 'user@host' token
+complete -c ssh-wiz -n '__fish_is_first_token' -a '(ssh-wiz --complete-hosts (commandline -cot))' -d 'user@host'
+complete -c ssh-wiz -n '__fish_seen_argument --no-quantifier -f -s f -s p -s t' -a '(ssh-wiz --complete-hosts (commandline -cot))' -d 'user@host'
 """,
 }
 
@@ -1502,6 +1541,11 @@ def run_main(args: list) -> None:
     if args[0] == "--complete":
         prefix = args[1] if len(args) > 1 else ""
         for c in complete_candidates(prefix):
+            print(c)
+        return
+    if args[0] == "--complete-hosts":
+        prefix = args[1] if len(args) > 1 else ""
+        for c in complete_user_hosts(prefix):
             print(c)
         return
     if args[0] == "--completion":

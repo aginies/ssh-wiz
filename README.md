@@ -43,6 +43,7 @@ ssh-wiz -p <host>    connect with -o PubkeyAuthentication=no
 ssh-wiz -t <host>    connect inside a per-host tmux session (wiz-<host>)
 ssh-wiz -f <host>    toggle favorite
 ssh-wiz --complete <prefix>   print hosts/flags matching prefix (completion)
+ssh-wiz --complete-hosts <prefix>  print user@host pairs matching prefix (completion)
 ssh-wiz --completion <shell>  print completion script (bash, zsh or fish)
 ssh-wiz --demo       launch the picker with built-in sample data
 ssh-wiz --version    print the version
@@ -78,8 +79,10 @@ screenshots without exposing real infrastructure.
 
 ### Shell completion
 
-Host names complete with the same fuzzy matching as the TUI
-(`rzn9` → `ryzen9`); flags complete by prefix. Add to your shell rc:
+The host argument completes as a single connectable `user@host` token — and
+only working `user@host` couples are offered (`rzn9` → `ryzen9`, like the TUI
+fuzzy filter), so a completion is never split into a user and a host.
+Flags complete by prefix.
 
 ```sh
 # bash
