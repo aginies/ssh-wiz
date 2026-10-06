@@ -356,8 +356,7 @@ class ConfigCacheTest(TempPathsTestCase):
         self.ssh_config.write_text("Host alpha\n  User alice\n")
         _hosts, order = shw.parse_ssh_config(self.ssh_config)
         self.assertEqual(order, ["alpha"])
-        self.ssh_config.write_text(
-            "Host alpha\n  User alice\nHost beta\n  User bob\n")
+        self.ssh_config.write_text("Host alpha\n  User alice\nHost beta\n  User bob\n")
         _hosts, order = shw.parse_ssh_config(self.ssh_config)
         self.assertEqual(order, ["alpha", "beta"])
 
@@ -373,11 +372,14 @@ class ConfigCacheTest(TempPathsTestCase):
 
     def test_category_rules_reread_after_write(self):
         self.categories.write_text("LAN  alpha\n")
-        self.assertEqual(shw.load_category_rules(self.categories),
-                         [("LAN", "alpha", None)])
+        self.assertEqual(
+            shw.load_category_rules(self.categories), [("LAN", "alpha", None)]
+        )
         self.categories.write_text("LAN  alpha  blue\nWORK  beta\n")
-        self.assertEqual(shw.load_category_rules(self.categories),
-                         [("LAN", "alpha", "blue"), ("WORK", "beta", None)])
+        self.assertEqual(
+            shw.load_category_rules(self.categories),
+            [("LAN", "alpha", "blue"), ("WORK", "beta", None)],
+        )
 
 
 class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
@@ -438,20 +440,16 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(n, 1)  # on_mount: initial command
                 # filter 'a' matches all three hosts; cursor stays on alpha
                 await pilot.press("a")
-                self.assertEqual(
-                    len([l for l in layout_passes if l]), n)
+                self.assertEqual(len([l for l in layout_passes if l]), n)
                 # cursor to gamma: command changed -> layout pass
                 await pilot.press("down")
-                self.assertEqual(
-                    len([l for l in layout_passes if l]), n + 1)
+                self.assertEqual(len([l for l in layout_passes if l]), n + 1)
                 # back to alpha: changed again
                 await pilot.press("up")
-                self.assertEqual(
-                    len([l for l in layout_passes if l]), n + 2)
+                self.assertEqual(len([l for l in layout_passes if l]), n + 2)
                 # 'up' at the top: same host -> no pass
                 await pilot.press("up")
-                self.assertEqual(
-                    len([l for l in layout_passes if l]), n + 2)
+                self.assertEqual(len([l for l in layout_passes if l]), n + 2)
 
     async def test_multi_user_rows_share_bare_name(self):
         self.ssh_config.write_text(
@@ -1186,7 +1184,7 @@ class FileListFilteredTest(unittest.TestCase):
         self.assertIs(lst.filtered, first)  # same inputs -> cached rows
         lst.filter = "f1"
         second = lst.filtered
-        self.assertIsNot(second, first)     # filter change invalidates
+        self.assertIsNot(second, first)  # filter change invalidates
         self.assertIs(lst.filtered, second)  # cached again
         lst.filter = ""
         lst.entries.append(self._entry("zzz.txt"))  # in-place mutation
