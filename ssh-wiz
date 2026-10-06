@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Author: aginies <antoine@ginies.org>
 """ssh-wiz — fast interactive SSH host picker (console TUI).
 
 Hosts are read from ~/.ssh/config (or $SSH_CONFIG if set), plus optional
