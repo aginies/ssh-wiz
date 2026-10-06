@@ -61,7 +61,7 @@ from rich.markup import escape
 from rich.style import Style
 from rich.text import Text
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def _ssh_config_path() -> Path:
