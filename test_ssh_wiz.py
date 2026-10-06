@@ -43,16 +43,20 @@ class TempPathsTestCase(unittest.TestCase):
         self.ssh_config = root / "ssh_config"
         self.extra_hosts = root / "hosts"
         self.categories = root / "categories"
+        self.options_file = root / "options"
         self.favorites = root / "favorites"
         self.usage = root / "usage.json"
+        self.option_state = root / "options.json"
         self._saved = {a: getattr(shw, a) for a in _PATH_ATTRS}
         vars(shw).update(
             {
                 "SSH_CONFIG": self.ssh_config,
                 "EXTRA_HOSTS_FILE": self.extra_hosts,
                 "CATEGORIES_FILE": self.categories,
+                "OPTIONS_FILE": self.options_file,
                 "FAVORITES_FILE": self.favorites,
                 "USAGE_FILE": self.usage,
+                "OPTION_STATE_FILE": self.option_state,
                 "CONFIG_DIR": root,
                 "STATE_DIR": root,
             }
@@ -297,13 +301,12 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             wl = app.query_one(shw.HostList)
             self.assertEqual([h.name for h in wl.shown], ["alpha", "gamma", "beta"])
             lines = str(wl.render()).splitlines()
-            self.assertEqual(lines[0], "─" * 80)
-            self.assertTrue(lines[1].startswith("★ alpha"))
-            self.assertEqual(lines[2], "─" * 80)
-            self.assertTrue(lines[3].startswith(" LAN"))
-            self.assertTrue(lines[4].startswith("  gamma"))
-            self.assertTrue(lines[5].startswith(" WORK"))
-            self.assertTrue(lines[6].startswith("  beta"))
+            self.assertTrue(lines[0].startswith("★ alpha"))
+            self.assertEqual(lines[1], "─" * 80)
+            self.assertTrue(lines[2].startswith(" LAN"))
+            self.assertTrue(lines[3].startswith("  gamma"))
+            self.assertTrue(lines[4].startswith(" WORK"))
+            self.assertTrue(lines[5].startswith("  beta"))
 
     async def test_no_separator_without_favorites(self):
         self.write_hosts()
@@ -311,14 +314,13 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)):
             wl = app.query_one(shw.HostList)
             lines = str(wl.render()).splitlines()
-            self.assertEqual(lines[0], "─" * 80)
-            self.assertTrue(lines[1].startswith(" LAN"))
-            self.assertTrue(lines[2].startswith("  alpha"))
-            self.assertTrue(lines[3].startswith("  gamma"))
-            self.assertTrue(lines[4].startswith(" WORK"))
-            self.assertTrue(lines[5].startswith("  beta"))
-            # only the top border, no separator below favorites
-            self.assertEqual(sum(1 for l in lines if l == "─" * 80), 1)
+            self.assertTrue(lines[0].startswith(" LAN"))
+            self.assertTrue(lines[1].startswith("  alpha"))
+            self.assertTrue(lines[2].startswith("  gamma"))
+            self.assertTrue(lines[3].startswith(" WORK"))
+            self.assertTrue(lines[4].startswith("  beta"))
+            # no separators in the list itself (the top line is CmdLine's)
+            self.assertEqual(sum(1 for l in lines if l == "─" * 80), 0)
 
     async def test_multi_user_rows_share_bare_name(self):
         self.ssh_config.write_text(
@@ -328,14 +330,14 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)):
             wl = app.query_one(shw.HostList)
             lines = str(wl.render()).splitlines()
-            # top border, OTHER header, then both rows: bare host name in
+            # OTHER header, then both rows: bare host name in
             # column 1, the user only in column 2
-            self.assertTrue(lines[1].startswith(" OTHER"))
+            self.assertTrue(lines[0].startswith(" OTHER"))
+            self.assertTrue(lines[1].startswith("  ryzen9"))
+            self.assertIn("root@ryzen9", lines[1])
             self.assertTrue(lines[2].startswith("  ryzen9"))
-            self.assertIn("root@ryzen9", lines[2])
-            self.assertTrue(lines[3].startswith("  ryzen9"))
-            self.assertIn("aginies@ryzen9", lines[3])
-            self.assertNotIn("(aginies)", lines[2] + lines[3])
+            self.assertIn("aginies@ryzen9", lines[2])
+            self.assertNotIn("(aginies)", lines[1] + lines[2])
 
     async def test_scroll_keeps_cursor_visible_with_separator(self):
         self.ssh_config.write_text(
@@ -385,6 +387,123 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertIn("DB", tabs)
         self.assertNotIn("WORK", tabs)
 
+    async def test_options_panel_toggle_cycle_and_persist(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("ctrl+o")
+            panel = app.query_one(shw.OptionsPanel)
+            self.assertTrue(panel.display)
+            self.assertIn("value", str(app.query_one("#hints", shw.Static).render()))
+            await pilot.press("right")  # no-pubkey: off → no
+            self.assertEqual(app.option_state["no-pubkey"], "PubkeyAuthentication=no")
+            await pilot.press("down", "right")  # x11: off → yes
+            self.assertEqual(app.option_state["x11"], "ForwardX11=yes")
+            await pilot.press("escape")
+            self.assertFalse(panel.display)
+            # values are kept for the next open
+            await pilot.press("ctrl+o")
+            self.assertEqual(app.option_state["no-pubkey"], "PubkeyAuthentication=no")
+            self.assertEqual(app.option_state["x11"], "ForwardX11=yes")
+            await pilot.press("escape")
+        # and persisted across runs
+        self.assertEqual(
+            shw.load_option_state(),
+            {
+                "no-pubkey": "PubkeyAuthentication=no",
+                "x11": "ForwardX11=yes",
+                "comp": "",
+            },
+        )
+
+    async def test_options_appear_in_copied_command(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        app = shw.SSHWiz()
+        with mock.patch.object(shw, "copy_to_clipboard", return_value=True) as cp:
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("ctrl+o")
+                await pilot.press("right")  # no-pubkey on
+                await pilot.press("escape")
+                await pilot.press("ctrl+y")
+        self.assertIn("-o PubkeyAuthentication=no", str(cp.call_args))
+
+    async def test_cmdline_shows_final_command(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\nHost beta\n  User bob\n")
+        with mock.patch.object(shw, "tmux_available", return_value=True):
+            app = shw.SSHWiz()
+            async with app.run_test(size=(80, 24)) as pilot:
+                cl = app.query_one(shw.CmdLine)
+                lines = str(cl.render()).splitlines()
+                self.assertEqual(lines[0], "─" * 80)
+                self.assertIn("ssh alpha", lines[1])
+                self.assertEqual(lines[2], "─" * 80)
+                await pilot.press("down")
+                lines = str(cl.render()).splitlines()
+                self.assertIn("ssh beta", lines[1])
+                await pilot.press("ctrl+o")
+                await pilot.press("right")  # no-pubkey on
+                await pilot.press("escape")
+                await pilot.press("ctrl+t")  # tmux mode
+                lines = str(cl.render()).splitlines()
+                self.assertIn("-o PubkeyAuthentication=no", lines[1])
+                self.assertIn("-t", lines[1])
+                self.assertIn("tmux new -A -s wiz-beta", lines[1])
+
+    async def test_cmdline_wraps_long_command(self):
+        self.ssh_config.write_text("")
+        self.extra_hosts.write_text("box  root@10.0.1.253\n")
+        with mock.patch.object(shw, "tmux_available", return_value=True):
+            app = shw.SSHWiz()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("ctrl+o")
+                await pilot.press("right")  # no-pubkey
+                await pilot.press("down", "right")  # x11
+                await pilot.press("down", "right")  # comp
+                await pilot.press("escape")
+                await pilot.press("ctrl+t")
+                cl = app.query_one(shw.CmdLine)
+                text = str(cl.render())
+                # 109-char command wraps: nothing clipped, tmux suffix visible
+                self.assertIn("ssh -t -o PubkeyAuthentication=no", text)
+                self.assertIn("tmux new -A -s wiz-box", text)
+                # the widget grew from 3 rows to 4 (wrapped command)
+                self.assertEqual(cl.region.height, 4)
+
+    async def test_help_overlay(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        with mock.patch.object(shw, "tmux_available", return_value=True):
+            app = shw.SSHWiz()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("question_mark")
+                self.assertIsInstance(app.screen, shw.HelpScreen)
+                text = str(app.screen.query_one(shw.Static).render())
+                self.assertIn("^o", text)
+                self.assertIn("tmux", text)
+                # modal: typing does not filter the list underneath
+                await pilot.press("a")
+                self.assertEqual(app.query_one(shw.HostList).filter, "")
+                await pilot.press("escape")
+                self.assertNotIsInstance(app.screen, shw.HelpScreen)
+                # F1 opens again, q closes
+                await pilot.press("f1")
+                self.assertIsInstance(app.screen, shw.HelpScreen)
+                await pilot.press("q")
+                self.assertNotIsInstance(app.screen, shw.HelpScreen)
+
+    async def test_hints_hide_tmux_when_unavailable(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        with mock.patch.object(shw, "tmux_available", return_value=False):
+            app = shw.SSHWiz()
+            async with app.run_test(size=(80, 24)) as pilot:
+                hints = str(app.query_one("#hints", shw.Static).render())
+                self.assertNotIn("^t", hints)
+                await pilot.press("ctrl+t")
+                self.assertFalse(app.tmux_mode)
+                await pilot.press("question_mark")
+                text = str(app.screen.query_one(shw.Static).render())
+                self.assertNotIn("tmux", text)
+                await pilot.press("escape")
+
 
 class BuildSshCmdTest(unittest.TestCase):
     def make_host(self, **kw):
@@ -392,9 +511,23 @@ class BuildSshCmdTest(unittest.TestCase):
         base.update(kw)
         return shw.Host(**base)
 
+    def test_options_emitted_in_order(self):
+        h = self.make_host()
+        cmd = shw.build_ssh_cmd(h, ["ForwardX11=yes", "Compression=auto"])
+        self.assertEqual(
+            cmd, ["ssh", "-o", "ForwardX11=yes", "-o", "Compression=auto", "foo"]
+        )
+
+    def test_options_with_port_extra_and_tmux(self):
+        h = self.make_host(cmd_port="8022", extra="-o Foo=bar")
+        cmd = shw.build_ssh_cmd(h, ["PubkeyAuthentication=no"], tmux_mode=True)
+        self.assertEqual(cmd[:4], ["ssh", "-t", "-o", "PubkeyAuthentication=no"])
+        self.assertIn("-p", cmd)
+        self.assertIn("foo", cmd)
+
     def test_full(self):
         h = self.make_host(cmd_port="8022", extra="-o Foo=bar")
-        cmd = shw.build_ssh_cmd(h, password_mode=True, tmux_mode=True)
+        cmd = shw.build_ssh_cmd(h, ["PubkeyAuthentication=no"], tmux_mode=True)
         self.assertEqual(
             cmd,
             [
@@ -544,6 +677,39 @@ class MiscTest(TempPathsTestCase):
         self.assertIsNone(h.user)
 
 
+class OptionsTest(TempPathsTestCase):
+    def test_defaults_without_file(self):
+        opts = dict(shw.load_options())
+        self.assertEqual(opts["no-pubkey"], ("PubkeyAuthentication=no",))
+        self.assertEqual(opts["comp"], ("Compression=yes", "Compression=auto"))
+
+    def test_file_replaces_defaults(self):
+        self.options_file.write_text(
+            "# comment\n"
+            "x11  ForwardX11=yes\n"
+            "alive  ServerAliveInterval=60|120\n"
+            "badline\n"
+            "x11  Duplicate=no\n"
+        )
+        self.assertEqual(
+            dict(shw.load_options()),
+            {
+                "x11": ("ForwardX11=yes",),
+                "alive": ("ServerAliveInterval=60", "ServerAliveInterval=120"),
+            },
+        )
+
+    def test_empty_file_means_no_options(self):
+        self.options_file.write_text("# only a comment\n")
+        self.assertEqual(shw.load_options(), [])
+
+    def test_state_roundtrip_and_corrupt(self):
+        shw.save_option_state({"x11": "ForwardX11=yes"})
+        self.assertEqual(shw.load_option_state(), {"x11": "ForwardX11=yes"})
+        self.option_state.write_text("garbage")
+        self.assertEqual(shw.load_option_state(), {})
+
+
 class SshConfigPathTest(unittest.TestCase):
     def test_env_var_wins(self):
         with mock.patch.dict(os.environ, {"SSH_CONFIG": "/tmp/xyz"}):
@@ -655,6 +821,30 @@ class CliTest(TempPathsTestCase):
         with self.assertRaises(SystemExit) as cm:
             self.run_main("-t", "host", "ls")
         self.assertIn("cannot combine", str(cm.exception.code))
+
+    def test_cli_tmux_flag_requires_tmux(self):
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+        with (
+            mock.patch.object(shw, "tmux_available", return_value=False),
+            self.assertRaises(SystemExit) as cm,
+        ):
+            self.run_main("-t", "foo")
+        self.assertIn("tmux is not installed", str(cm.exception.code))
+
+    def test_password_flag_enables_option(self):
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+        with mock.patch.object(shw.os, "execvp") as execvp:
+            self.run_main("-p", "foo")
+        args = execvp.call_args[0][1]
+        self.assertEqual(args[args.index("-o") + 1], "PubkeyAuthentication=no")
+
+    def test_cli_uses_saved_option_state(self):
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+        shw.save_option_state({"x11": "ForwardX11=yes"})
+        with mock.patch.object(shw.os, "execvp") as execvp:
+            self.run_main("foo")
+        args = execvp.call_args[0][1]
+        self.assertEqual(args[args.index("-o") + 1], "ForwardX11=yes")
 
 
 class CompletionTest(TempPathsTestCase):

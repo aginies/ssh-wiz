@@ -26,11 +26,13 @@ TUI keys:
   up/down   move cursor   (also PgUp/PgDn, Home/End)
   enter     connect to selected host
   ^f        toggle favorite for selected host
-  ^o        toggle password mode (adds -o PubkeyAuthentication=no)
+  ^o        toggle ssh options panel (cycle -o values: no-pubkey, x11, …)
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
   ^g        open ~/.config/ssh-wiz/categories ($EDITOR), then refresh
+  ^h        (alias) — terminals send backspace for ^h, so use ? / F1
+  ? / F1    show full key help (overlay; esc/?/F1/q closes)
   ^r        refresh host list
   esc       clear filter
   ^q / ^c   quit
@@ -74,10 +76,13 @@ FAVORITES_FILE = CONFIG_DIR / "favorites"
 USAGE_FILE = STATE_DIR / "usage.json"
 EXTRA_HOSTS_FILE = CONFIG_DIR / "hosts"
 CATEGORIES_FILE = CONFIG_DIR / "categories"
+OPTIONS_FILE = CONFIG_DIR / "options"           # ^o panel: which options
+OPTION_STATE_FILE = STATE_DIR / "options.json"  # ^o panel: last values
 # --demo: all data files are pointed at a temp dir with sample data
 # (start_demo/stop_demo); the real config and state are never touched.
 _PATH_ATTRS = ("SSH_CONFIG", "CONFIG_DIR", "STATE_DIR", "FAVORITES_FILE",
-               "USAGE_FILE", "EXTRA_HOSTS_FILE", "CATEGORIES_FILE")
+               "USAGE_FILE", "EXTRA_HOSTS_FILE", "CATEGORIES_FILE",
+               "OPTIONS_FILE", "OPTION_STATE_FILE")
 # Header written to a freshly created categories file (^g).
 CATEGORIES_TEMPLATE = """\
 # ssh-wiz categories — one rule per line:
@@ -156,6 +161,12 @@ def user_color(user: str) -> str:
 def tmux_session_name(host: Host) -> str:
     """Per-host tmux session name (tmux forbids '.' and ':' in names)."""
     return "wiz-" + re.sub(r"[.:@ ()]+", "-", host.name).strip("-")
+
+
+def tmux_available() -> bool:
+    """Whether tmux is installed locally (practical proxy: the session
+    itself runs on the remote host)."""
+    return shutil.which("tmux") is not None
 
 
 def category_order(hosts: list[Host], rules: list) -> list:
@@ -503,13 +514,83 @@ def triage_hosts(shown: list, favs: set, cat_order: list) -> list:
     return out
 
 
-def build_ssh_cmd(host: Host, password_mode: bool, tmux_mode: bool = False,
+# Toggleable ssh options for the ^o panel. The user file
+# (~/.config/ssh-wiz/options) replaces these defaults; one per line:
+#   label    option=value1|value2|...
+# In the panel each option cycles off → v1 → … → off; enabled options are
+# passed to ssh as -o <value>.
+DEFAULT_OPTIONS = (
+    # label      ssh option(s)
+    ("no-pubkey", "PubkeyAuthentication=no"),
+    ("x11", "ForwardX11=yes"),
+    ("comp", "Compression=yes|auto"),
+)
+
+
+def _option_values(spec: str) -> tuple:
+    """'Compression=yes|auto' -> ('Compression=yes', 'Compression=auto')."""
+    name, eq, rest = spec.partition("=")
+    if not eq or not name:
+        return ()
+    return tuple(f"{name}={v.strip()}" for v in rest.split("|") if v.strip())
+
+
+def load_options(path: Path | None = None) -> list:
+    """[(label, (option=value, ...))] for the ^o panel; the user file
+    replaces the built-in defaults. Malformed lines are skipped."""
+    text = None
+    try:
+        text = (path or OPTIONS_FILE).read_text()
+    except OSError:
+        pass
+    if text is None:
+        return [(label, _option_values(spec))
+                for label, spec in DEFAULT_OPTIONS]
+    opts, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue  # malformed: want label option=value
+        label, values = parts[0], _option_values(parts[1])
+        if label in seen or not values:
+            continue
+        seen.add(label)
+        opts.append((label, values))
+    return opts
+
+
+def load_option_state(path: Path | None = None) -> dict:
+    """{label: option=value} — last ^o panel values (off is not stored);
+    malformed files are ignored."""
+    try:
+        data = json.loads((path or OPTION_STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str)}
+
+
+def save_option_state(state: dict, path: Path | None = None) -> None:
+    path = path or OPTION_STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, path)
+
+
+def build_ssh_cmd(host: Host, options: list | None = None,
+                  tmux_mode: bool = False,
                   remote_cmd: list | None = None) -> list:
     cmd = ["ssh"]
     if tmux_mode:
         cmd.append("-t")
-    if password_mode:
-        cmd += ["-o", "PubkeyAuthentication=no"]
+    for opt in options or []:
+        cmd += ["-o", opt]
     if host.cmd_port:
         cmd += ["-p", host.cmd_port]
     if host.extra:
@@ -573,12 +654,74 @@ def find_config_line(name: str):
 # connect) start without paying for the TUI dependency.
 from textual import events  # noqa: E402
 from textual.app import App, ComposeResult, SuspendNotSupported  # noqa: E402
+from textual.screen import Screen  # noqa: E402
 from textual.widget import Widget  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 
-HINTS = ("type: filter    ←→: cat    ↑↓: select    ⏎: connect    ^f: fav    "
-         "^o: passwd    ^t: tmux    ^y: copy    ^e: edit    ^g: cats    "
-         "esc: clear    ^q: quit")
+
+def hints_text() -> str:
+    """Bottom-bar key hints; ^t is only shown when tmux is installed."""
+    parts = ["type: filter", "←→: cat", "↑↓: select", "⏎: connect",
+             "^f: fav", "^o: opts"]
+    if tmux_available():
+        parts.append("^t: tmux")
+    parts += ["^y: copy", "^e: edit", "^g: cats", "?/F1: help",
+              "esc: clear", "^q: quit"]
+    return "    ".join(parts)
+
+
+OPTIONS_HINTS = ("↑↓: select    ←→/⏎: value (off → v1 → … → off)    "
+                 "esc/^o: close    changes apply live")
+
+
+def help_text() -> str:
+    lines = [
+        "ssh-wiz help",
+        "",
+        "  type        fuzzy-filter hosts (letters in order)",
+        "  ←/→         previous/next category (tab/shift-tab too)",
+        "  ↑/↓         move cursor (PgUp/PgDn, Home/End too)",
+        "  ⏎           connect to selected host",
+        "  ^f          toggle favorite for selected host",
+        "  ^o          ssh options panel (↑↓ select, ←→/⏎ cycle, esc close)",
+    ]
+    if tmux_available():
+        lines.append("  ^t          toggle tmux mode (tmux new -A -s wiz-<host>)")
+    lines += [
+        "  ^y          copy the ssh command for the selected host",
+        "  ^e          open ~/.ssh/config at the selected host",
+        "  ^g          open categories file, then refresh",
+        "  ^h          (terminals send backspace for ^h, so use ? / F1)",
+        "  ? / F1      this help",
+        "  ^r          refresh host list",
+        "  esc         clear filter / close panel",
+        "  ^q / ^c     quit",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+class HelpScreen(Screen):
+    """Full key help overlay; ^h opens, esc/^h/q closes. Modal: while
+    open it swallows every key (nothing falls through to the app)."""
+    CSS = """
+    HelpScreen {
+        align: center middle;
+    }
+    HelpScreen Static {
+        width: auto;
+        border: heavy $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(help_text())
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in ("escape", "ctrl+h", "question_mark", "f1", "q"):
+            self.app.pop_screen()
+        event.stop()
 
 
 class HostList(Widget):
@@ -622,11 +765,11 @@ class HostList(Widget):
                    else "no hosts found — check ~/.ssh/config")
             t.append(f"  {msg}", style="dim")
             return t
-        # Layout: top border below the top bar, favorites block, a dim
-        # separator, then non-favorites grouped by category (ALL view) with
-        # a header per group.
+        # Layout: favorites block, a dim separator, then non-favorites
+        # grouped by category (ALL view) with a header per group. (The top
+        # line above the list is drawn by CmdLine.)
         n_fav = favorite_split(self.shown, self.favs)
-        rows: list = [("sep", None)]
+        rows: list = []
         rows.extend(("host", i) for i in range(n_fav))
         if 0 < n_fav < len(self.shown):
             rows.append(("sep", None))
@@ -677,6 +820,81 @@ class HostList(Widget):
         self.refresh()
 
 
+class OptionsPanel(Widget):
+    """The ^o panel: one row per ssh option. ↑↓ selects, ←/→/⏎ cycles the
+    selected option's value (off → v1 → … → off). Keys are handled by the
+    app (see SSHWiz.options_key)."""
+    can_focus = True
+    DEFAULT_CSS = """
+    OptionsPanel {
+        width: 100%;
+        height: auto;
+        max-height: 12;
+        background: $surface;
+        display: none;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cursor = 0
+
+    def render(self):
+        app = self.app
+        t = Text()
+        t.append(" ssh options", style="bold")
+        t.append("      ←→/⏎: value    esc: close", style="dim")
+        for i, (label, _values) in enumerate(app.options):
+            cur = app.option_state.get(label, "")
+            row = Text()
+            prefix = "→ " if i == self.cursor else "  "
+            style = "bold reverse" if i == self.cursor else ""
+            row.append(f"{prefix}{label:<10}", style=style)
+            if cur:
+                row.append(f" {cur}", style="bold")
+            else:
+                row.append(" off", style="dim")
+            t.append("\n")
+            t.append_text(row)
+        return t
+
+
+class CmdLine(Widget):
+    """The final ssh command for the selected host, drawn below the
+    category tabs (options panel when open) between two dim separator
+    lines. Shows exactly what enter / ^y will run; long commands wrap
+    to a second line instead of being clipped."""
+    DEFAULT_CSS = """
+    CmdLine {
+        width: 100%;
+        height: auto;
+        min-height: 3;
+        background: $surface;
+    }
+    """
+
+    def render(self) -> Text:
+        app = self.app
+        hl = app.query_one(HostList)
+        t = Text(end="")
+        t.append("─" * max(1, self.size.width), style="dim")
+        t.append("\n")
+        if hl.shown:
+            host = hl.shown[hl.cursor]
+            cmd = " ".join(
+                build_ssh_cmd(host, app.enabled_options(), app.tmux_mode))
+            t.append(cmd)
+        else:
+            t.append("(no host selected)", style="dim")
+        t.append("\n")
+        t.append("─" * max(1, self.size.width), style="dim")
+        return t
+
+    def on_resize(self, event) -> None:
+        self.refresh()
+
+
 class SSHWiz(App):
     TITLE = "ssh-wiz"
 
@@ -705,7 +923,13 @@ class SSHWiz(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self.password_mode = False
+        self.options = load_options()
+        saved = load_option_state()
+        self.option_state = {}
+        for label, values in self.options:  # stale values dropped
+            v = saved.get(label, "")
+            self.option_state[label] = v if v in values else ""
+        self.options_open = False
         self.tmux_mode = False
         self.connecting = False
         self.categories = [ALL_CATEGORY]
@@ -715,8 +939,10 @@ class SSHWiz(App):
     def compose(self) -> ComposeResult:
         yield Static("", id="status")
         yield Static("", id="tabs")
+        yield OptionsPanel()
+        yield CmdLine()
         yield HostList()
-        yield Static(HINTS, id="hints")
+        yield Static(hints_text(), id="hints")
 
     # -- data
 
@@ -766,14 +992,22 @@ class SSHWiz(App):
         if DEMO:
             parts.append("[bold magenta]DEMO MODE[/] (sample data — "
                          "no real connections)")
-        if self.password_mode:
-            parts.append("[bold red]PASSWORD MODE[/] (-o PubkeyAuthentication=no)")
+        if self.option_state and any(self.option_state.values()):
+            enabled = [l for l, _v in self.options
+                       if self.option_state.get(l)]
+            parts.append("opts: " +
+                         " ".join(f"[bold]{escape(l)}[/]" for l in enabled))
         if self.tmux_mode:
             parts.append("[bold green]TMUX[/] (tmux new -A -s wiz-<host>)")
         if hl.filter:
             parts.append(f"filter: [bold]{escape(hl.filter)}[/]")
         parts.append(f"{len(hl.shown)}/{len(hl.hosts)} hosts")
         self.query_one("#status", Static).update("   ".join(parts))
+        self.update_cmd()
+
+    def update_cmd(self) -> None:
+        # layout=True: a wrapped command changes the widget's auto height
+        self.query_one(CmdLine).refresh(layout=True)
 
     def on_mount(self) -> None:
         if DEMO:
@@ -803,7 +1037,7 @@ class SSHWiz(App):
             return
         if DEMO:
             cmd = " ".join(
-                build_ssh_cmd(host, self.password_mode, self.tmux_mode))
+                build_ssh_cmd(host, self.enabled_options(), self.tmux_mode))
             self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
             record_use(host.name)  # demo state only: shows the ranking
             self.reload()
@@ -814,7 +1048,7 @@ class SSHWiz(App):
                     break
             hl.refresh()
             return
-        cmd = build_ssh_cmd(host, self.password_mode, self.tmux_mode)
+        cmd = build_ssh_cmd(host, self.enabled_options(), self.tmux_mode)
         self.connecting = True
         self.query_one("#status", Static).update(
             f"[bold cyan]⏳ ssh {escape(host.display)} — terminal handed over…[/]")
@@ -844,6 +1078,68 @@ class SSHWiz(App):
         if not hl.shown:
             return
         self.connect_to(hl.shown[hl.cursor])
+
+    # -- options panel (^o)
+
+    def enabled_options(self) -> list:
+        """Enabled 'option=value' strings, in panel order."""
+        return [self.option_state[label]
+                for label, _values in self.options
+                if self.option_state.get(label)]
+
+    def toggle_help(self) -> None:
+        if isinstance(self.screen, HelpScreen):
+            self.pop_screen()
+        else:
+            self.push_screen(HelpScreen())
+
+    def toggle_options_panel(self) -> None:
+        panel = self.query_one(OptionsPanel)
+        if self.options_open:
+            self.close_options_panel()
+        else:
+            if not self.options:
+                self.notify(f"no ssh options defined ({OPTIONS_FILE})",
+                            severity="warning")
+                return
+            panel.cursor = 0
+            panel.styles.display = "block"  # DEFAULT_CSS hides it
+            self.options_open = True
+            panel.focus()
+            self.query_one("#hints", Static).update(OPTIONS_HINTS)
+            self.update_status()
+
+    def close_options_panel(self) -> None:
+        self.query_one(OptionsPanel).styles.display = "none"
+        self.options_open = False
+        self.query_one("#hints", Static).update(hints_text())
+        self.query_one(HostList).focus()
+        self.update_status()
+
+    def options_key(self, key: str) -> None:
+        panel = self.query_one(OptionsPanel)
+        if key in ("escape", "ctrl+o"):
+            self.close_options_panel()
+        elif key == "up":
+            panel.cursor = max(0, panel.cursor - 1)
+            panel.refresh()
+        elif key == "down":
+            panel.cursor = min(len(self.options) - 1, panel.cursor + 1)
+            panel.refresh()
+        elif key in ("left", "right", "enter"):
+            self.cycle_option(-1 if key == "left" else 1)
+
+    def cycle_option(self, delta: int) -> None:
+        panel = self.query_one(OptionsPanel)
+        label, values = self.options[panel.cursor]
+        n = len(values) + 1  # off + all values
+        cur = self.option_state.get(label, "")
+        i = (values.index(cur) if cur in values else -1) + delta
+        i %= n
+        self.option_state[label] = "" if i == n - 1 else values[i]
+        save_option_state(self.option_state)
+        panel.refresh()
+        self.update_status()
 
     def edit_config(self) -> None:
         if DEMO:
@@ -904,6 +1200,12 @@ class SSHWiz(App):
         if key in ("ctrl+c", "ctrl+q"):
             self.exit()
             event.stop()
+        elif key in ("ctrl+h", "question_mark", "f1"):
+            self.toggle_help()
+            event.stop()
+        elif self.options_open:
+            self.options_key(key)
+            event.stop()
         elif key == "backspace":
             hl.filter = hl.filter[:-1]
             hl.apply_filter()
@@ -918,28 +1220,34 @@ class SSHWiz(App):
         elif key == "up":
             hl.cursor = max(0, hl.cursor - 1)
             hl.refresh()
+            self.update_cmd()
             event.stop()
         elif key == "down":
             if hl.shown:
                 hl.cursor = min(len(hl.shown) - 1, hl.cursor + 1)
             hl.refresh()
+            self.update_cmd()
             event.stop()
         elif key == "home":
             hl.cursor = 0
             hl.refresh()
+            self.update_cmd()
             event.stop()
         elif key == "end":
             hl.cursor = max(0, len(hl.shown) - 1)
             hl.refresh()
+            self.update_cmd()
             event.stop()
         elif key == "pageup":
             hl.cursor = max(0, hl.cursor - max(1, hl.size.height - 2))
             hl.refresh()
+            self.update_cmd()
             event.stop()
         elif key == "pagedown":
             hl.cursor = min(max(0, len(hl.shown) - 1),
                             hl.cursor + max(1, hl.size.height - 2))
             hl.refresh()
+            self.update_cmd()
             event.stop()
         elif key == "enter":
             self.do_connect()
@@ -954,17 +1262,19 @@ class SSHWiz(App):
             self.toggle_favorite()
             event.stop()
         elif key == "ctrl+o":
-            self.password_mode = not self.password_mode
-            self.update_status()
+            self.toggle_options_panel()
             event.stop()
         elif key == "ctrl+t":
-            self.tmux_mode = not self.tmux_mode
-            self.update_status()
+            if tmux_available():
+                self.tmux_mode = not self.tmux_mode
+                self.update_status()
+            else:
+                self.notify("tmux is not installed", severity="warning")
             event.stop()
         elif key == "ctrl+y":
             if hl.shown:
                 host = hl.shown[hl.cursor]
-                cmd = " ".join(build_ssh_cmd(host, self.password_mode))
+                cmd = " ".join(build_ssh_cmd(host, self.enabled_options()))
                 if copy_to_clipboard(cmd):
                     self.notify(f"copied: {cmd}")
                 else:
@@ -1124,6 +1434,7 @@ def start_demo() -> Path:
     global DEMO, _demo_saved, _demo_root
     global SSH_CONFIG, CONFIG_DIR, STATE_DIR
     global FAVORITES_FILE, USAGE_FILE, EXTRA_HOSTS_FILE, CATEGORIES_FILE
+    global OPTIONS_FILE, OPTION_STATE_FILE
     root = Path(tempfile.mkdtemp(prefix="ssh-wiz-demo-"))
     _demo_saved = {a: globals()[a] for a in _PATH_ATTRS}
     _demo_root = root
@@ -1136,6 +1447,8 @@ def start_demo() -> Path:
     USAGE_FILE = STATE_DIR / "usage.json"
     EXTRA_HOSTS_FILE = CONFIG_DIR / "hosts"
     CATEGORIES_FILE = CONFIG_DIR / "categories"
+    OPTIONS_FILE = CONFIG_DIR / "options"
+    OPTION_STATE_FILE = STATE_DIR / "options.json"
     SSH_CONFIG.write_text(DEMO_SSH_CONFIG)
     EXTRA_HOSTS_FILE.write_text(DEMO_EXTRA_HOSTS)
     CATEGORIES_FILE.write_text(DEMO_CATEGORIES)
@@ -1250,9 +1563,24 @@ def run_main(args: list) -> None:
     remote_cmd = rest[1:]
     if tmux_mode and remote_cmd:
         sys.exit("ssh-wiz: cannot combine -t with a remote command")
+    if tmux_mode and not tmux_available():
+        sys.exit("ssh-wiz: tmux is not installed")
+    opts = load_options()
+    state = load_option_state()
+    options = [state[label] for label, values in opts
+               if state.get(label) in values]
+    if password_mode:  # -p: enable PubkeyAuthentication=no
+        for _label, values in opts:
+            if any(v.split("=", 1)[0] == "PubkeyAuthentication"
+                   for v in values):
+                for v in values:
+                    if v.split("=", 1)[1] == "no":
+                        options.append(v)
+                        break
+                break
     record_use(host.name)
     try:
-        os.execvp("ssh", build_ssh_cmd(host, password_mode, tmux_mode, remote_cmd))
+        os.execvp("ssh", build_ssh_cmd(host, options, tmux_mode, remote_cmd))
     except OSError as e:
         sys.exit(f"ssh-wiz: cannot run ssh: {e}")
 

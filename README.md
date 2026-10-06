@@ -6,7 +6,8 @@ reads your `~/.ssh/config` and gets you connected.
 - Fuzzy filter (`rzn9` → `ryzen9`), category tabs, per-user colors
 - Ranking: favorites first, then most-recently-used, grouped by category
   in the ALL view (usage decays exponentially, 7-day time constant)
-- Per-host tmux sessions, password mode
+- Per-host tmux sessions, ssh options panel (`^o`)
+- Live ssh command preview below the tabs (exactly what ⏎/^y will run)
 - Fuzzy shell completion for bash, zsh and fish
 - Single file, no build step
 
@@ -54,11 +55,12 @@ screenshots without exposing real infrastructure.
 | ↑/↓ · PgUp/PgDn · Home/End | move cursor |
 | enter | connect to selected host |
 | ^f | toggle favorite for selected host |
-| ^o | toggle password mode (`-o PubkeyAuthentication=no`) |
-| ^t | toggle tmux mode (`tmux new -A -s wiz-<host>`) |
+| ^o | toggle the ssh options panel (↑↓ select, ←→/⏎ cycle value, esc close) |
+| ^t | toggle tmux mode (`tmux new -A -s wiz-<host>`; hint hidden when tmux is not installed) |
 | ^y | copy the ssh command for the selected host |
 | ^e | open `~/.ssh/config` at the selected host (`$EDITOR`) |
 | ^g | open `~/.config/ssh-wiz/categories` (`$EDITOR`), then refresh |
+| ? / F1 | show full key help (esc/?/F1/q closes) |
 | ^r | refresh host list |
 | esc | clear filter |
 | ^q / ^c | quit |
@@ -115,6 +117,23 @@ land in a `TAILSCALE` tab automatically — no rule needed. This covers both
 `~/.ssh/config` names and extra hosts (via their target IP). A user rule
 always wins over the built-in detection, so you can still pin a specific
 Tailscale IP to another category.
+
+### `~/.config/ssh-wiz/options` — ssh options for `^o`
+
+One option per line: `<label>  <option=value1|value2|...>`. `^o` opens a
+panel below the category tabs where each option cycles
+`off → v1 → … → off`; enabled options are passed to ssh as `-o <value>`,
+shown in the status bar, and remembered across runs
+(`~/.local/state/ssh-wiz/options.json`). Without this file the built-in
+defaults are offered:
+
+```
+no-pubkey  PubkeyAuthentication=no
+x11        ForwardX11=yes
+comp       Compression=yes|auto
+```
+
+`-p/--password` is shorthand for enabling `PubkeyAuthentication=no`.
 
 ### `~/.config/ssh-wiz/favorites` — favorites
 
