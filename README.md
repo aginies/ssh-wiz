@@ -4,8 +4,8 @@ Fast interactive SSH host picker — a console TUI (built on [Textual]) that
 reads your `~/.ssh/config` and gets you connected.
 
 - Fuzzy filter (`rzn9` → `ryzen9`), category tabs, per-user colors
-- Ranking: favorites first, then most-recently-used, grouped by category
-  in the ALL view (usage decays exponentially, 7-day time constant)
+- Ordering: favorites first, then A→Z by host within each category
+  (the ALL view groups hosts by category)
 - Per-host tmux sessions, ssh options panel (`^o`)
 - Live ssh command preview below the tabs (exactly what ⏎/^y will run)
 - Fuzzy shell completion for bash, zsh and fish
@@ -13,7 +13,14 @@ reads your `~/.ssh/config` and gets you connected.
 
 ## Install
 
-Python 3.9+ with:
+Python 3.9+ with Textual and Rich. On SUSE/openSUSE the system package
+pulls in both:
+
+```sh
+zypper in python3-textual python3-rich
+```
+
+Otherwise install from PyPI:
 
 ```sh
 pip install "textual>=8.2.0" "rich>=13.0.0"
@@ -25,7 +32,7 @@ Put `ssh-wiz` on your `PATH` (it is a single executable script).
 
 ```
 ssh-wiz              launch the interactive picker
-ssh-wiz -l           list hosts (ranked), no TUI
+ssh-wiz -l           list hosts (favorites first, A→Z), no TUI
 ssh-wiz <host>       connect directly, no TUI
 ssh-wiz <host> cmd   connect and run cmd (and args) on the host
 ssh-wiz -p <host>    connect with -o PubkeyAuthentication=no

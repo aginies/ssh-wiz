@@ -286,8 +286,7 @@ class TriageHostsTest(unittest.TestCase):
 
 class RankHostsTest(TempPathsTestCase):
     def make(self, name, cat=shw.OTHER_CATEGORY, label=""):
-        return shw.Host(name=name, display=name, target=name,
-                        category=cat, label=label)
+        return shw.Host(name=name, display=name, target=name, category=cat, label=label)
 
     def test_alphabetic_by_first_column(self):
         # non-alphabetic input order is sorted by the first column
@@ -298,8 +297,7 @@ class RankHostsTest(TempPathsTestCase):
             self.make("beta", "WORK"),
         ]
         out, _favs = shw.rank_hosts(hosts)
-        self.assertEqual([h.name for h in out],
-                         ["alpha", "beta", "mid", "zeta"])
+        self.assertEqual([h.name for h in out], ["alpha", "beta", "mid", "zeta"])
 
     def test_multi_user_grouped_by_label(self):
         # every user of a host stays adjacent (same label); the plain
@@ -311,8 +309,7 @@ class RankHostsTest(TempPathsTestCase):
             self.make("beta", "WORK"),
         ]
         out, _favs = shw.rank_hosts(hosts)
-        self.assertEqual([h.name for h in out],
-                         ["alpha", "beta", "zeta", "zeta (bob)"])
+        self.assertEqual([h.name for h in out], ["alpha", "beta", "zeta", "zeta (bob)"])
 
     def test_favorites_pinned_first(self):
         self.favorites.write_text("mid\n")
