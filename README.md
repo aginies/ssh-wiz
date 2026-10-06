@@ -4,9 +4,9 @@ Fast interactive SSH host picker — a console TUI (built on [Textual]) that
 reads your `~/.ssh/config` and gets you connected.
 
 - Fuzzy filter (`rzn9` → `ryzen9`), category tabs, per-user colors
-- Ranking: favorites first, then most-recently-used (usage decays
-  exponentially, 7-day time constant)
-- Per-host tmux sessions, password mode, ad-hoc `user@host` connects
+- Ranking: favorites first, then most-recently-used, grouped by category
+  in the ALL view (usage decays exponentially, 7-day time constant)
+- Per-host tmux sessions, password mode
 - Fuzzy shell completion for bash, zsh and fish
 - Single file, no build step
 
@@ -32,6 +32,7 @@ ssh-wiz -t <host>    connect inside a per-host tmux session (wiz-<host>)
 ssh-wiz -f <host>    toggle favorite
 ssh-wiz --complete <prefix>   print hosts/flags matching prefix (completion)
 ssh-wiz --completion <shell>  print completion script (bash, zsh or fish)
+ssh-wiz --version    print the version
 ssh-wiz -h           this help
 ```
 
@@ -48,9 +49,8 @@ ssh-wiz -h           this help
 | ^t | toggle tmux mode (`tmux new -A -s wiz-<host>`) |
 | ^y | copy the ssh command for the selected host |
 | ^e | open `~/.ssh/config` at the selected host (`$EDITOR`) |
-| ^a | ad-hoc connect (type `user@host`) |
 | ^r | refresh host list |
-| esc | clear filter / cancel ad-hoc |
+| esc | clear filter |
 | ^q / ^c | quit |
 
 ### Shell completion
@@ -72,7 +72,11 @@ ssh-wiz --completion fish | source
 ## Configuration
 
 Hosts are read from `~/.ssh/config` (or `$SSH_CONFIG` if set).
-The files below are optional; create them as needed.
+If the same host appears in several `Host` blocks with different `User`
+values, each user gets its own entry: the first one (what plain `ssh <host>`
+uses) keeps the host name, the others appear as `<host> (<user>)` and connect
+as `user@host` — ssh still applies the config for the host (port,
+identityfile, ...). The files below are optional; create them as needed.
 
 ### `~/.config/ssh-wiz/hosts` — extra hosts
 

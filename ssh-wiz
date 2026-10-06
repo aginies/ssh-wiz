@@ -28,9 +28,8 @@ TUI keys:
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
-  ^a        ad-hoc connect (type user@host)
   ^r        refresh host list
-  esc       clear filter / cancel ad-hoc
+  esc       clear filter
   ^q / ^c   quit
 """
 from __future__ import annotations
@@ -86,9 +85,11 @@ DECAY_SECONDS = 7 * 86400  # usage score decays exponentially (7-day time consta
 @dataclass
 class Host:
     """One connectable host (~/.ssh/config entry or extra-hosts file line)."""
-    name: str                 # config name / extra-hosts alias
+    name: str                 # unique key: config name, or 'name (user)' for a
+                              # second+ user of the same host
     display: str              # plain 'user@host[:port]' (status lines, clipboard)
     target: str               # what is passed to ssh
+    label: str = ""           # name column in TUI/-l (defaults to name)
     category: str = OTHER_CATEGORY
     user: str | None = None       # display only (ssh resolves it from config)
     host: str | None = None       # display only
@@ -114,7 +115,7 @@ def user_color(user: str) -> str:
 
 def tmux_session_name(host: Host) -> str:
     """Per-host tmux session name (tmux forbids '.' and ':' in names)."""
-    return "wiz-" + re.sub(r"[.:@]", "-", host.name)
+    return "wiz-" + re.sub(r"[.:@ ()]+", "-", host.name).strip("-")
 
 
 def category_order(hosts: list[Host], rules: list) -> list:
@@ -213,7 +214,10 @@ def _default_user() -> str:
 def parse_ssh_config(path: Path) -> tuple[dict, list]:
     """Parse ~/.ssh/config -> (hosts dict, ordered names).
 
-    ssh semantics: first value seen wins per host. Match blocks are skipped.
+    ssh semantics: first value seen wins per host (port, identityfile).
+    User is the exception: every distinct user across the host's blocks
+    is kept, in order of appearance, so the picker can offer each one.
+    Match blocks are skipped.
     Comments: a '#' at line start, or preceded by whitespace, starts a
     comment.
     """
@@ -244,11 +248,15 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
             current = [n for n in value.split() if not any(c in n for c in "*?")]
             for n in current:
                 if n not in hosts:
-                    hosts[n] = {"user": None, "port": None, "identityfile": None}
+                    hosts[n] = {"users": [], "port": None, "identityfile": None}
                     order.append(n)
         elif in_match or not current:
             continue
-        elif key in ("user", "port", "identityfile"):
+        elif key == "user":
+            for n in current:
+                if value not in hosts[n]["users"]:
+                    hosts[n]["users"].append(value)
+        elif key in ("port", "identityfile"):
             for n in current:
                 if hosts[n][key] is None:
                     hosts[n][key] = value
@@ -316,24 +324,31 @@ def build_hosts(rules: list | None = None) -> list[Host]:
     hosts = []
     for name in order:
         h = cfg[name]
-        user = h["user"] or _default_user()
         port = h["port"]
-        if "@" in user:  # e.g. GSSAPI principal: show host, user in parens
-            display = name + (f":{port}" if port and port != "22" else "") + f" ({user})"
-            hosts.append(Host(
-                name=name, display=display, target=name,
-                user=None, host=name, port=port, principal=user,
-                identityfile=h["identityfile"],
-                category=categorize(name, rules),
-            ))
-        else:
-            display = f"{user}@{name}" + (f":{port}" if port and port != "22" else "")
-            hosts.append(Host(
-                name=name, display=display, target=name,
-                user=user, host=name, port=port,
-                identityfile=h["identityfile"],
-                category=categorize(name, rules),
-            ))
+        users = h["users"] or [_default_user()]
+        for i, user in enumerate(users):
+            # First user: the plain config name (ssh resolves it, first
+            # value wins). Later users: separate entry with a unique name
+            # and an explicit user@host target (ssh still applies the
+            # config for the host: port, identityfile, ...).
+            entry = name if i == 0 else f"{name} ({user})"
+            target = name if i == 0 else f"{user}@{name}"
+            if "@" in user:  # e.g. GSSAPI principal: show host, user in parens
+                display = name + (f":{port}" if port and port != "22" else "") + f" ({user})"
+                hosts.append(Host(
+                    name=entry, display=display, target=target, label=name,
+                    user=None, host=name, port=port, principal=user,
+                    identityfile=h["identityfile"],
+                    category=categorize(name, rules),
+                ))
+            else:
+                display = f"{user}@{name}" + (f":{port}" if port and port != "22" else "")
+                hosts.append(Host(
+                    name=entry, display=display, target=target, label=name,
+                    user=user, host=name, port=port,
+                    identityfile=h["identityfile"],
+                    category=categorize(name, rules),
+                ))
     for e in parse_extra_hosts(EXTRA_HOSTS_FILE):
         if any(h.name == e["name"] for h in hosts):
             continue
@@ -374,7 +389,7 @@ def _append_display(line: Text, h: Host) -> None:
         line.append(h.host, style="bold")
         if h.port and h.port != "22":
             line.append(f":{h.port}", style="dim")
-    else:  # ad-hoc host: fall back to plain display
+    else:  # no user info (direct-connect fallback): plain display
         line.append(h.display)
 
 
@@ -491,10 +506,10 @@ def find_config_line(name: str):
 from textual import events  # noqa: E402
 from textual.app import App, ComposeResult, SuspendNotSupported  # noqa: E402
 from textual.widget import Widget  # noqa: E402
-from textual.widgets import Input, Static  # noqa: E402
+from textual.widgets import Static  # noqa: E402
 
-HINTS = ("type: filter    ←→: cat    ↑↓: move    ⏎: connect    ^f: fav    "
-         "^o: passwd    ^t: tmux    ^y: copy    ^e: edit    ^a: ad-hoc    "
+HINTS = ("type: filter    ←→: cat    ↑↓: select    ⏎: connect    ^f: fav    "
+         "^o: passwd    ^t: tmux    ^y: copy    ^e: edit    "
          "esc: clear    ^q: quit")
 
 
@@ -577,7 +592,7 @@ class HostList(Widget):
                 fav = h.name in self.favs
                 line.append("★ " if fav else "  ",
                             style="yellow" if fav else "dim")
-                line.append(f"{h.name:<32}", style="bold")
+                line.append(f"{(h.label or h.name):<32}", style="bold")
                 line.append(COL_SEP, style="dim")
                 _append_display(line, h)
                 if h.identityfile:
@@ -610,13 +625,6 @@ class SSHWiz(App):
         color: $text;
         padding: 0 1;
     }
-    #adhoc {
-        height: 1;
-        margin: 0 1;
-    }
-    #adhoc.hidden {
-        display: none;
-    }
     #hints {
         height: 1;
         background: $surface;
@@ -639,8 +647,6 @@ class SSHWiz(App):
     def compose(self) -> ComposeResult:
         yield Static("", id="status")
         yield Static("", id="tabs")
-        yield Input(placeholder="ad-hoc: user@host   (⏎ connect, esc cancel)",
-                    id="adhoc")
         yield HostList()
         yield Static(HINTS, id="hints")
 
@@ -699,7 +705,6 @@ class SSHWiz(App):
         self.query_one("#status", Static).update("   ".join(parts))
 
     def on_mount(self) -> None:
-        self.query_one("#adhoc", Input).add_class("hidden")
         self.reload()
         self.query_one(HostList).focus()
 
@@ -759,7 +764,7 @@ class SSHWiz(App):
         if not hl.shown:
             return
         host = hl.shown[hl.cursor]
-        line = find_config_line(host.name)
+        line = find_config_line(host.host or host.name)
         if line is None:
             line = 1
             self.notify(f"{host.name} not in ~/.ssh/config — opening top",
@@ -783,33 +788,9 @@ class SSHWiz(App):
             return
         self.reload()
 
-    def show_adhoc(self, show: bool) -> None:
-        adhoc = self.query_one("#adhoc", Input)
-        if show:
-            adhoc.remove_class("hidden")
-            adhoc.value = ""
-            adhoc.focus()
-        else:
-            adhoc.add_class("hidden")
-            self.query_one(HostList).focus()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id != "adhoc":
-            return
-        target = event.value.strip()
-        self.show_adhoc(False)
-        if target:
-            self.connect_to(Host(name=target, display=target, target=target))
-
     # -- keys
 
     def on_key(self, event: events.Key) -> None:
-        adhoc = self.query_one("#adhoc", Input)
-        if "hidden" not in adhoc.classes:
-            if event.key in ("escape", "ctrl+c", "ctrl+q"):
-                self.show_adhoc(False)
-                event.stop()
-            return  # let the Input handle its own keys
         hl = self.query_one(HostList)
         key = event.key
         if key in ("ctrl+c", "ctrl+q"):
@@ -884,9 +865,6 @@ class SSHWiz(App):
             event.stop()
         elif key == "ctrl+e":
             self.edit_config()
-            event.stop()
-        elif key == "ctrl+a":
-            self.show_adhoc(True)
             event.stop()
         elif key == "ctrl+r":
             self.reload()
@@ -998,7 +976,7 @@ def main() -> None:
             line = Text()
             line.append("★ " if h.name in favs else "  ",
                         style="bold yellow" if h.name in favs else "dim")
-            line.append(f"{h.name:<32}", style="bold")
+            line.append(f"{(h.label or h.name):<32}", style="bold")
             line.append(COL_SEP, style="dim")
             _append_display(line, h)
             if h.category and h.category != OTHER_CATEGORY:

@@ -75,9 +75,18 @@ class ParseSshConfigTest(TempPathsTestCase):
         )
         hosts, order = shw.parse_ssh_config(self.ssh_config)
         self.assertEqual(order, ["foo", "bar"])
-        self.assertEqual(hosts["foo"]["user"], "alice")
+        # every distinct user is kept, in order of appearance
+        self.assertEqual(hosts["foo"]["users"], ["alice", "bob"])
+        # port/identityfile: first value still wins
         self.assertEqual(hosts["foo"]["port"], "2222")
-        self.assertEqual(hosts["bar"]["user"], "carol")
+        self.assertEqual(hosts["bar"]["users"], ["carol"])
+
+    def test_duplicate_users_deduped(self):
+        self.write_config(
+            "Host foo\n  User alice\nHost foo\n  User alice\n  User bob\n"
+        )
+        hosts, _order = shw.parse_ssh_config(self.ssh_config)
+        self.assertEqual(hosts["foo"]["users"], ["alice", "bob"])
 
     def test_tabs_and_match_blocks(self):
         self.write_config(
@@ -87,7 +96,7 @@ class ParseSshConfigTest(TempPathsTestCase):
         )
         hosts, order = shw.parse_ssh_config(self.ssh_config)
         self.assertEqual(order, ["baz", "qux"])
-        self.assertEqual(hosts["baz"]["user"], "tabby")
+        self.assertEqual(hosts["baz"]["users"], ["tabby"])
         self.assertIsNone(hosts["baz"]["port"])  # Match block skipped
 
     def test_host_patterns_skipped(self):
@@ -107,7 +116,7 @@ class ParseSshConfigTest(TempPathsTestCase):
         )
         hosts, order = shw.parse_ssh_config(self.ssh_config)
         self.assertEqual(order, ["foo"])
-        self.assertEqual(hosts["foo"]["user"], "alice")
+        self.assertEqual(hosts["foo"]["users"], ["alice"])
         self.assertEqual(hosts["foo"]["port"], "2222")
         # no whitespace before '#': part of the value, not a comment
         self.assertEqual(hosts["foo"]["identityfile"], "id_x#y")
@@ -157,6 +166,35 @@ class BuildHostsTest(TempPathsTestCase):
         self.assertEqual(hosts["foo"].category, shw.OTHER_CATEGORY)
         self.assertEqual(hosts["nouser"].user, shw._default_user())
         self.assertEqual(hosts["nouser"].display, shw._default_user() + "@example.org")
+
+    def test_multiple_users_per_host(self):
+        self.ssh_config.write_text(
+            "Host ryzen9\n  Port 22\n  IdentityFile ~/.ssh/id_rsa\n"
+            "Host ryzen9\n  User llm\n"
+            "Host ryzen9\n  User root\n"
+        )
+        hosts = shw.build_hosts()
+        self.assertEqual([h.name for h in hosts], ["ryzen9", "ryzen9 (root)"])
+        # first user: plain config name, ssh resolves it (first value wins)
+        self.assertEqual(hosts[0].user, "llm")
+        self.assertEqual(hosts[0].target, "ryzen9")
+        self.assertEqual(hosts[0].identityfile, "~/.ssh/id_rsa")
+        # later user: separate entry with explicit user@host target
+        self.assertEqual(hosts[1].user, "root")
+        self.assertEqual(hosts[1].target, "root@ryzen9")
+        self.assertEqual(hosts[1].host, "ryzen9")
+        self.assertEqual(hosts[1].display, "root@ryzen9")
+        self.assertEqual(hosts[1].identityfile, "~/.ssh/id_rsa")
+        # name column shows the bare host for every user entry
+        self.assertEqual(hosts[0].label, "ryzen9")
+        self.assertEqual(hosts[1].label, "ryzen9")
+
+    def test_find_host_multi_user_entry(self):
+        self.ssh_config.write_text(
+            "Host ryzen9\n  User llm\nHost ryzen9\n  User root\n"
+        )
+        self.assertEqual(shw.find_host("ryzen9").target, "ryzen9")
+        self.assertEqual(shw.find_host("ryzen9 (root)").target, "root@ryzen9")
 
     def test_ipv6_and_bracketed_ports(self):
         self.extra_hosts.write_text("v6  ::1\nv6p  [::1]:8022\nv4  10.0.1.5:99\n")
@@ -268,6 +306,23 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             # only the top border, no separator below favorites
             self.assertEqual(sum(1 for l in lines if l == "─" * 80), 1)
 
+    async def test_multi_user_rows_share_bare_name(self):
+        self.ssh_config.write_text(
+            "Host ryzen9\n  User root\nHost ryzen9\n  User aginies\n"
+        )
+        app = shw.SSHWiz()
+        async with app.run_test(size=(80, 24)):
+            wl = app.query_one(shw.HostList)
+            lines = str(wl.render()).splitlines()
+            # top border, OTHER header, then both rows: bare host name in
+            # column 1, the user only in column 2
+            self.assertTrue(lines[1].startswith(" OTHER"))
+            self.assertTrue(lines[2].startswith("  ryzen9"))
+            self.assertIn("root@ryzen9", lines[2])
+            self.assertTrue(lines[3].startswith("  ryzen9"))
+            self.assertIn("aginies@ryzen9", lines[3])
+            self.assertNotIn("(aginies)", lines[2] + lines[3])
+
     async def test_scroll_keeps_cursor_visible_with_separator(self):
         self.ssh_config.write_text(
             "\n".join(f"Host h{i:02d}\n  User u{i:02d}\n" for i in range(12)) + "\n"
@@ -320,6 +375,8 @@ class BuildSshCmdTest(unittest.TestCase):
         self.assertEqual(shw.tmux_session_name(h), "wiz-login-suse-de")
         h2 = shw.Host(name="user@10.0.1.5:99", display="", target="")
         self.assertEqual(shw.tmux_session_name(h2), "wiz-user-10-0-1-5-99")
+        h3 = shw.Host(name="ryzen9.guibland.com (root)", display="", target="")
+        self.assertEqual(shw.tmux_session_name(h3), "wiz-ryzen9-guibland-com-root")
 
 
 class MiscTest(TempPathsTestCase):
@@ -470,6 +527,16 @@ class CompletionTest(TempPathsTestCase):
 
     def test_all_hosts_in_config_order(self):
         self.assertEqual(shw.complete_candidates(""), ["ryzen9", "web1", "ex"])
+
+    def test_multi_user_entries(self):
+        self.ssh_config.write_text(
+            "Host ryzen9\n  User llm\nHost ryzen9\n  User root\n"
+        )
+        self.assertEqual(
+            shw.complete_candidates(""),
+            ["ryzen9", "ryzen9 (root)", "ex"],
+        )
+        self.assertEqual(shw.complete_candidates("root"), ["ryzen9 (root)"])
 
     def test_fuzzy_match(self):
         self.assertEqual(shw.complete_candidates("rzn9"), ["ryzen9"])
