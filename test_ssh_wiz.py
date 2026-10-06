@@ -65,6 +65,14 @@ class TempPathsTestCase(unittest.TestCase):
         for a, v in self._saved.items():
             setattr(shw, a, v)
 
+    def run_main(self, *argv):
+        old = sys.argv
+        sys.argv = ["ssh-wiz", *argv]
+        try:
+            shw.main()
+        finally:
+            sys.argv = old
+
 
 class ParseSshConfigTest(TempPathsTestCase):
     def write_config(self, text: str) -> None:
@@ -762,14 +770,6 @@ class SshConfigPathTest(unittest.TestCase):
 
 
 class DemoTest(TempPathsTestCase):
-    def run_main(self, *argv):
-        old = sys.argv
-        sys.argv = ["ssh-wiz", *argv]
-        try:
-            shw.main()
-        finally:
-            sys.argv = old
-
     def test_start_and_stop_roundtrip(self):
         root = shw.start_demo()
         self.addCleanup(shw.stop_demo)
@@ -818,14 +818,6 @@ class DemoTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
 
 
 class CliTest(TempPathsTestCase):
-    def run_main(self, *argv):
-        old = sys.argv
-        sys.argv = ["ssh-wiz", *argv]
-        try:
-            shw.main()
-        finally:
-            sys.argv = old
-
     def test_help(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -919,14 +911,6 @@ class CompletionTest(TempPathsTestCase):
 
 
 class CompletionCliTest(TempPathsTestCase):
-    def run_main(self, *argv):
-        old = sys.argv
-        sys.argv = ["ssh-wiz", *argv]
-        try:
-            shw.main()
-        finally:
-            sys.argv = old
-
     def test_complete(self):
         self.ssh_config.write_text("Host ryzen9\n  User alice\n")
         out = io.StringIO()
