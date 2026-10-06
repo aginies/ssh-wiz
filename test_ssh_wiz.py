@@ -1072,11 +1072,24 @@ class BuildTransferCmdTest(unittest.TestCase):
 
     def test_shell_reuses_one_ssh_connection(self):
         # ControlMaster multiplexes listing/probe/delete/transfer over one
-        # socket; ControlPersist keeps it warm between operations
+        # socket; ControlPersist keeps it warm between operations. The
+        # ControlPath dir is resolved literally (some ssh builds reject %t)
+        # and must point at a real, writable directory.
         shell = shw._rsync_ssh_shell(self.make_host())
         self.assertIn("-o ControlMaster=auto", shell)
         self.assertIn("ControlPath=", shell)
         self.assertIn("ControlPersist=60", shell)
+        cp = shell.split("ControlPath=")[1].split()[0]
+        self.assertTrue(cp.endswith("/ssh-wiz-%C"))
+        self.assertTrue(os.path.isdir(os.path.dirname(cp)))
+
+    def test_shell_without_tempdir_omits_controlmaster(self):
+        # No usable temp dir: fall back to one connection per operation
+        # instead of failing with a broken ControlPath
+        with mock.patch.object(shw, "_control_path", return_value=None):
+            shell = shw._rsync_ssh_shell(self.make_host())
+        self.assertNotIn("ControlMaster", shell)
+        self.assertNotIn("ControlPath", shell)
 
     def test_download_direction_swaps_operands(self):
         h = self.make_host()

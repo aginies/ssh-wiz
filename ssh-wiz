@@ -628,23 +628,41 @@ def _sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def _control_path() -> str | None:
+    """ControlPath for SSH connection reuse, or None if no usable temp dir.
+
+    The directory is resolved here (TMPDIR, then /tmp) and embedded
+    literally: some ssh builds (e.g. SUSE's patched OpenSSH) reject %t in
+    ControlPath with 'unknown key %t' and fail the whole connection. %C
+    (a hash of user@host:port) keeps the path short for long names. With
+    no writable temp dir the ControlMaster options are omitted entirely
+    (each operation opens its own connection) rather than failing."""
+    for d in (tempfile.gettempdir(), "/tmp"):
+        try:
+            if os.path.isdir(d) and os.access(d, os.W_OK):
+                return f"{d}/ssh-wiz-%C"
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def _rsync_ssh_shell(host: Host, options: list | None = None) -> str:
     """The `-e` shell rsync uses to reach the host: ssh with the same
     port/identityfile/options ssh would (ssh's port flag is -p, lowercase).
     ControlMaster multiplexes every sync-screen connection (listing,
     version probe, delete, transfer) over one SSH socket: the first
     operation pays the handshake, the rest reuse the master, which lingers
-    60 s (ControlPersist) so consecutive directory hops stay fast. The
-    ControlPath uses %C (a hash) so long user/host names cannot exceed the
-    unix socket path limit."""
+    60 s (ControlPersist) so consecutive directory hops stay fast."""
     parts = ["ssh"]
     if host.cmd_port:
         parts += ["-p", host.cmd_port]
     if host.identityfile:
         parts += ["-i", os.path.expanduser(host.identityfile)]
-    parts += ["-o", "ControlMaster=auto",
-              "-o", "ControlPath=%t/ssh-wiz-%C",
-              "-o", "ControlPersist=60"]
+    cp = _control_path()
+    if cp:
+        parts += ["-o", "ControlMaster=auto",
+                  "-o", f"ControlPath={cp}",
+                  "-o", "ControlPersist=60"]
     for opt in options or []:
         parts += ["-o", opt]
     if host.extra:
