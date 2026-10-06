@@ -1943,14 +1943,37 @@ def _tui():
         }
         """
 
+        def __init__(self) -> None:
+            super().__init__()
+            self._last_cmd: str | None = None
+
+        def _command(self) -> str:
+            """The ssh command for the cursor host ('' if no host shown)."""
+            hl = self.app.query_one(HostList)
+            if not hl.shown:
+                return ""
+            host = hl.shown[hl.cursor]
+            return " ".join(build_ssh_cmd(
+                host, self.app.enabled_options(), self.app.tmux_mode))
+
+        def update_if_changed(self) -> None:
+            """refresh(layout=True) only when the command actually changed:
+            update_status() runs on every keystroke, but the command
+            depends only on the cursor host, the option state and the
+            tmux mode — a forced layout pass per keystroke was the main
+            per-key cost of the main screen."""
+            cmd = self._command()
+            if cmd == self._last_cmd:
+                return
+            self._last_cmd = cmd
+            # layout=True: a wrapped command changes the widget's auto height
+            self.refresh(layout=True)
+
         def render(self) -> Text:
-            app = self.app
-            hl = app.query_one(HostList)
             t = Text(end="")
-            if hl.shown:
-                host = hl.shown[hl.cursor]
-                cmd = " ".join(
-                    build_ssh_cmd(host, app.enabled_options(), app.tmux_mode))
+            cmd = (self._last_cmd if self._last_cmd is not None
+                   else self._command())
+            if cmd:
                 t.append(cmd)
             else:
                 t.append("(no host selected)", style="dim")
@@ -2074,8 +2097,7 @@ def _tui():
             self.update_cmd()
 
         def update_cmd(self) -> None:
-            # layout=True: a wrapped command changes the widget's auto height
-            self.query_one(CmdLine).refresh(layout=True)
+            self.query_one(CmdLine).update_if_changed()
 
         def on_mount(self) -> None:
             if DEMO:

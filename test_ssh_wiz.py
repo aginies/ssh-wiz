@@ -380,6 +380,41 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             # no separators in the list itself (the top line is CmdLine's)
             self.assertEqual(sum(1 for l in lines if l == "─" * 80), 0)
 
+    async def test_cmdline_layout_pass_only_when_command_changes(self):
+        # update_status() runs on every keystroke, but CmdLine must only
+        # force a layout pass (refresh(layout=True)) when the rendered
+        # command actually changes
+        self.write_hosts()
+        app = shw.SSHWiz()
+        layout_passes = []
+        orig = shw.CmdLine.refresh
+
+        def counting(self, *a, **kw):
+            layout_passes.append(kw.get("layout"))
+            return orig(self, *a, **kw)
+
+        with mock.patch.object(shw.CmdLine, "refresh", counting):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                n = len([l for l in layout_passes if l])
+                self.assertGreaterEqual(n, 1)  # on_mount: initial command
+                # filter 'a' matches all three hosts; cursor stays on alpha
+                await pilot.press("a")
+                self.assertEqual(
+                    len([l for l in layout_passes if l]), n)
+                # cursor to gamma: command changed -> layout pass
+                await pilot.press("down")
+                self.assertEqual(
+                    len([l for l in layout_passes if l]), n + 1)
+                # back to alpha: changed again
+                await pilot.press("up")
+                self.assertEqual(
+                    len([l for l in layout_passes if l]), n + 2)
+                # 'up' at the top: same host -> no pass
+                await pilot.press("up")
+                self.assertEqual(
+                    len([l for l in layout_passes if l]), n + 2)
+
     async def test_multi_user_rows_share_bare_name(self):
         self.ssh_config.write_text(
             "Host ryzen9\n  User root\nHost ryzen9\n  User aginies\n"
