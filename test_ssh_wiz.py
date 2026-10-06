@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -659,13 +658,6 @@ class MiscTest(TempPathsTestCase):
     def test_user_color_stable(self):
         self.assertEqual(shw.user_color("root"), shw.user_color("root"))
         self.assertIn(shw.user_color("root"), shw.USER_COLORS)
-
-    def test_usage_score_decays(self):
-        now = time.time()
-        usage = {"a": [now - 10, now - shw.DECAY_SECONDS]}
-        score = shw.usage_score(usage, "a", now)
-        self.assertGreater(score, 1.0)
-        self.assertLess(score, 2.0)
 
     def test_record_use_caps_and_atomic(self):
         for _ in range(60):

@@ -3,7 +3,7 @@
 
 Hosts are read from ~/.ssh/config (or $SSH_CONFIG if set), plus optional
 ~/.config/ssh-wiz/hosts; categories from ~/.config/ssh-wiz/categories.
-Favorites and most-recently-used hosts are kept at the top.
+Favorites are kept at the top; the rest are alphabetical (A→Z).
 
 Usage:
   ssh-wiz              launch the interactive picker
@@ -42,7 +42,6 @@ from __future__ import annotations
 import fnmatch
 import ipaddress
 import json
-import math
 import os
 import re
 import shlex
@@ -124,7 +123,6 @@ USER_COLORS = ("bright_red", "bright_green", "bright_yellow", "bright_blue",
                "dark_orange", "bright_white")
 AT_COLOR = "bold grey63"
 COL_SEP = " │ "  # dim column separator in host rows
-DECAY_SECONDS = 7 * 86400  # usage score decays exponentially (7-day time constant)
 
 
 @dataclass
@@ -132,7 +130,7 @@ class Host:
     """One connectable host (~/.ssh/config entry or extra-hosts file line)."""
     name: str                 # unique key: config name, or 'name (user)' for a
                               # second+ user of the same host
-    display: str              # plain 'user@host[:port]' (status lines, clipboard)
+    display: str              # plain 'user@host[:port]' (status lines, no-user rows)
     target: str               # what is passed to ssh
     label: str = ""           # name column in TUI/-l (defaults to name)
     category: str = OTHER_CATEGORY
@@ -232,11 +230,6 @@ def record_use(name: str) -> None:
     tmp = USAGE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(usage))
     os.replace(tmp, USAGE_FILE)
-
-
-def usage_score(usage: dict, name: str, now: float) -> float:
-    return sum(math.exp(-(now - t) / DECAY_SECONDS)
-               for t in usage.get(name, []))
 
 
 def load_favorites() -> list:
