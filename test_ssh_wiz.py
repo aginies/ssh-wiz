@@ -1811,6 +1811,48 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.screen._pct, 100)
                 self.assertAlmostEqual(app.screen._speed, 1.0e6, delta=1)
 
+    async def test_status_capped_but_counts_complete(self):
+        # Thousands of files: the status box keeps only the last
+        # _MAX_STATUS_ITEMS lines (it is max-height 14), but the final
+        # counts must cover every item and the oldest lines are dropped
+        self.write_hosts()
+        app = shw.SSHWiz()
+        n = 120
+        itemize = "".join(f">f+++++++++ f{i:03d}.bin\n" for i in range(n))
+
+        async def no_probe(self):
+            pass
+
+        with (
+            mock.patch.object(
+                shw.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(
+                    return_value=_FakeRsyncProc(raw_stdout=itemize.encode())
+                ),
+            ),
+            # rsync < 3.1: no --info=progress2, itemize lines only
+            mock.patch.object(shw, "local_rsync_version", return_value=(3, 0, 0)),
+            mock.patch.object(shw.FileSyncScreen, "_probe_remote_rsync", no_probe),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                app.screen.remote_rsync = None
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name=f"f{i:03d}.bin",
+                                  path=f"/tmp/f{i:03d}.bin", selected=True)
+                    for i in range(n)
+                ]
+                await pilot.press("f5")
+                await pilot.pause()
+                await pilot.pause()
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+        self.assertIn(f"done  {n} file(s)", status)
+        self.assertIn("earlier item(s) not shown", status)
+        self.assertIn("f119.bin", status)      # newest item still shown
+        self.assertNotIn("f000.bin", status)   # oldest dropped from display
+
     async def test_esc_during_transfer_asks_confirmation(self):
         self.write_hosts()
         app = shw.SSHWiz()

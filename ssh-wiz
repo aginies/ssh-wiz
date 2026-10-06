@@ -1497,25 +1497,38 @@ class FileSyncScreen(Screen):
             progress=progress)
         self.app.run_worker(self._run_sync(cmd, len(selected), progress))
 
+    # The status box is max-height: 14, so keep only this many itemize
+    # lines for display (older ones are counted, not rendered); live
+    # progress re-renders are throttled to ~4 Hz.
+    _MAX_STATUS_ITEMS = 30
+    _RENDER_INTERVAL = 0.25
+
     async def _run_sync(self, cmd: list, total: int, progress: bool) -> None:
         done = 0
-        items: list = []
+        items: list = []  # last _MAX_STATUS_ITEMS itemize lines (display)
+        counts = {"f": 0, "d": 0, "=": 0}  # totals over the whole transfer
+        n_items = 0
         self._xfer_bytes = 0
         self._speed = 0.0
         self._pct = 0
         self._avg_speed = 0.0
         t0 = time.monotonic()
+        last_render = 0.0
 
         def feed(segment: str) -> None:
             """Consume one \n-delimited segment of rsync stdout. With
             --info=progress2 a segment may hold an itemize line, a progress
             sample, or both (progress updates are \r-separated and can glue
             onto the next line), so each \r-part is tried against both."""
-            nonlocal done
+            nonlocal done, n_items, last_render
             for part in segment.split("\r"):
                 it = parse_itemize(part)
                 if it:
+                    n_items += 1
+                    counts[it[0]] += 1
                     items.append(it)
+                    if len(items) > self._MAX_STATUS_ITEMS:
+                        items.pop(0)
                     if not progress:  # without progress2, -i lines arrive on
                         done += 1     # completion; with it, they arrive on
                                       # start, so xfr# below counts instead
@@ -1528,8 +1541,15 @@ class FileSyncScreen(Screen):
                         self._speed = speed
                         if xfr is not None:
                             done = xfr
+                        # progress samples arrive continuously; re-rendering
+                        # the status box on every one is O(n^2) over a big
+                        # transfer, so throttle to ~4 Hz
+                        now = time.monotonic()
+                        if now - last_render >= self._RENDER_INTERVAL:
+                            last_render = now
                             self._render_sync_status(items, done, total,
-                                                     "transferring…", None)
+                                                     "transferring…", None,
+                                                     counts, n_items)
 
         try:
             # LC_ALL=C: stable number format in progress samples (some
@@ -1580,7 +1600,8 @@ class FileSyncScreen(Screen):
                             f"remote host ({self.host.display})?",
                             title="sync", severity="error")
             return
-        self._render_sync_status(items, done, total, "done", None)
+        self._render_sync_status(items, done, total, "done", None,
+                                 counts, n_items)
         # refresh the remote panel so what just arrived is visible
         self.app.run_worker(self._load_remote())
         local = self.query_one("#local-list", FileList)
@@ -1588,7 +1609,8 @@ class FileSyncScreen(Screen):
             e.selected = False
         local.refresh()
 
-    def _render_sync_status(self, items, done, total, state, error) -> None:
+    def _render_sync_status(self, items, done, total, state, error,
+                            counts=None, n_items=None) -> None:
         self._set_progress(done, total, state)
         status = self.query_one("#sync-status", Static)
         t = Text(end="")
@@ -1598,9 +1620,12 @@ class FileSyncScreen(Screen):
                 t.append(f"  {line}\n", style="red")
             status.update(t)
             return
-        files = sum(1 for ty, _ in items if ty == "f")
-        dirs = sum(1 for ty, _ in items if ty == "d")
-        syms = sum(1 for ty, _ in items if ty == "=")
+        if counts is None:  # called without item data (error/idle paths)
+            counts = {"f": 0, "d": 0, "=": 0}
+            for ty, _name in items:
+                counts[ty] = counts.get(ty, 0) + 1
+        files, dirs, syms = counts["f"], counts["d"], counts["="]
+        hidden = (n_items - len(items)) if n_items is not None else 0
         if state == "done":
             t.append(f" ✓ done  {files} file(s), {dirs} dir(s)",
                      style="bold green")
@@ -1616,6 +1641,8 @@ class FileSyncScreen(Screen):
             if self._pct:
                 t.append(f"  ·  {self._pct}%", style="dim")
         t.append("\n")
+        if hidden:
+            t.append(f"  … {hidden} earlier item(s) not shown\n", style="dim")
         for ty, name in items:
             if ty == "f":
                 t.append(f"  → {name}\n", style="green")
