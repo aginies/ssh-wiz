@@ -596,7 +596,7 @@ class HostList(Widget):
                 line.append(COL_SEP, style="dim")
                 _append_display(line, h)
                 if h.identityfile:
-                    line.append(COL_SEP, style="dim")
+                    line.append(" ")
                     line.append(f"[{Path(h.identityfile).expanduser().name}]",
                                 style="cyan dim")
                 if ref == self.cursor:
@@ -984,7 +984,7 @@ def main() -> None:
                 line.append(f"[{h.category}]",
                             style="bold " + colors.get(h.category, ""))
             if h.identityfile:
-                line.append(COL_SEP, style="dim")
+                line.append(" ")
                 line.append(f"[{Path(h.identityfile).expanduser().name}]",
                             style="cyan dim")
             console.print(line)
