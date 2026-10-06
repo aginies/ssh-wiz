@@ -1342,10 +1342,10 @@ def _tui():
                          id="sync-status")
             yield Static("", id="sync-help")
 
-        def on_mount(self) -> None:
+        async def on_mount(self) -> None:
             local = self.query_one("#local-list", FileList)
             remote = self.query_one("#remote-list", FileList)
-            local.entries = list_local_dir(Path(self.local_path))
+            local.entries = await self._list_local()
             local.active = True
             remote.active = False
             remote.error = None
@@ -1417,14 +1417,23 @@ def _tui():
             self._active_list().focus()
             self._refresh_bars()
 
-        def _open_dir(self) -> None:
+        async def _list_local(self) -> list:
+            """FileEntry list for the current local dir, off the UI thread:
+            the per-entry stat over a 20k-file directory is ~40 ms, a
+            visible hitch on every directory hop."""
+            return await asyncio.to_thread(
+                list_local_dir, Path(self.local_path))
+
+        async def _open_dir(self) -> None:
             lst = self._active_list()
             e = lst.entry_at_cursor()
             if e is None or not e.is_dir:
                 return
             if self.active == "local":
                 self.local_path = e.path
-                lst.entries = list_local_dir(Path(self.local_path))
+                lst.entries = await self._list_local()
+                if not self.is_mounted:  # screen closed during the load
+                    return
             else:
                 self.remote_path = self.remote_path.rstrip("/") + "/" + e.name
                 self.app.run_worker(self._load_remote())
@@ -1432,11 +1441,13 @@ def _tui():
             lst.refresh()
             self._refresh_bars()
 
-        def _go_up(self) -> None:
+        async def _go_up(self) -> None:
             lst = self._active_list()
             if self.active == "local":
                 self.local_path = str(Path(self.local_path).parent)
-                lst.entries = list_local_dir(Path(self.local_path))
+                lst.entries = await self._list_local()
+                if not self.is_mounted:  # screen closed during the load
+                    return
             else:
                 rp = self.remote_path.rstrip("/")
                 self.remote_path = rp.rsplit("/", 1)[0] if "/" in rp else ""
@@ -1747,11 +1758,11 @@ def _tui():
                 if not answer:
                     return
             if self.active == "local":
-                self._delete_local(e)
+                await self._delete_local(e)
             else:
                 self.app.run_worker(self._delete_remote(e))
 
-        def _delete_local(self, e) -> None:
+        async def _delete_local(self, e) -> None:
             try:
                 if e.is_dir and not e.is_symlink:
                     shutil.rmtree(e.path)
@@ -1761,7 +1772,9 @@ def _tui():
                 self._update_status(f"✗ could not delete {e.name}: {ex}")
                 return
             local = self.query_one("#local-list", FileList)
-            local.entries = list_local_dir(Path(self.local_path))
+            local.entries = await self._list_local()
+            if not self.is_mounted:  # screen closed during the load
+                return
             local.cursor, local.scroll = 0, 0
             local.refresh()
             self._refresh_bars()
@@ -1807,7 +1820,7 @@ def _tui():
 
         # -- keys
 
-        def on_key(self, event: events.Key) -> None:
+        async def on_key(self, event: events.Key) -> None:
             key = event.key
             if self.busy:
                 if key in ("escape", "q", "ctrl+q") and not self._confirm_open:
@@ -1861,10 +1874,10 @@ def _tui():
                 lst.refresh()
                 event.stop()
             elif key in ("enter", "right"):
-                self._open_dir()
+                await self._open_dir()
                 event.stop()
             elif key in ("backspace", "left"):
-                self._go_up()
+                await self._go_up()
                 event.stop()
             elif key == "space":
                 self._toggle_select()

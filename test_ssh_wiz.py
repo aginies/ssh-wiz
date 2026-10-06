@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -1962,6 +1963,26 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertIn("earlier item(s) not shown", status)
         self.assertIn("f119.bin", status)  # newest item still shown
         self.assertNotIn("f000.bin", status)  # oldest dropped from display
+
+    async def test_local_listing_runs_off_ui_thread(self):
+        # list_local_dir stats every entry (~40 ms on a 20k-file dir); it
+        # must not block the UI thread while a directory is opened
+        self.write_hosts()
+        app = shw.SSHWiz()
+        ui_thread = threading.get_ident()
+        seen = {}
+        orig = shw.list_local_dir
+
+        def threaded(path):
+            seen["thread"] = threading.get_ident()
+            return orig(path)
+
+        with mock.patch.object(shw, "list_local_dir", threaded):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+        self.assertIn("thread", seen)
+        self.assertNotEqual(seen["thread"], ui_thread)
 
     async def test_esc_during_transfer_asks_confirmation(self):
         self.write_hosts()
