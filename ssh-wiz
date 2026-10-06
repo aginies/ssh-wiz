@@ -236,12 +236,39 @@ def record_use(name: str) -> None:
     os.replace(tmp, USAGE_FILE)
 
 
-def load_favorites() -> list:
+_CONFIG_CACHE: dict = {}
+
+
+def _read_config_lines(path: Path) -> list | None:
+    """A config file's lines, cached by (mtime_ns, size); None if absent.
+
+    reload() re-runs on ^f, ctrl+r and after each connect, and the CLI
+    paths parse on every start: unchanged files are not re-read or
+    re-parsed. Writes always bump mtime_ns, so saves (favorites,
+    categories, config edits) are picked up on the next reload."""
     try:
-        text = FAVORITES_FILE.read_text()
+        st = path.stat()
     except OSError:
+        _CONFIG_CACHE.pop(path, None)
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _CONFIG_CACHE.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        _CONFIG_CACHE.pop(path, None)
+        return None
+    _CONFIG_CACHE[path] = (key, lines)
+    return lines
+
+
+def load_favorites() -> list:
+    lines = _read_config_lines(FAVORITES_FILE)
+    if lines is None:
         return []
-    return [l.strip() for l in text.splitlines()
+    return [l.strip() for l in lines
             if l.strip() and not l.startswith("#")]
 
 
@@ -276,11 +303,12 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
     """
     hosts: dict = {}
     order: list = []
-    if not path.exists():
+    lines = _read_config_lines(path)
+    if lines is None:
         return hosts, order
     current: list = []
     in_match = False
-    for raw in path.read_text().splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -319,9 +347,10 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
 def parse_extra_hosts(path: Path) -> list:
     """~/.config/ssh-wiz/hosts — one per line:  name  user@host[:port]  [extra ssh args]"""
     entries = []
-    if not path.exists():
+    lines = _read_config_lines(path)
+    if lines is None:
         return entries
-    for raw in path.read_text().splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -347,9 +376,10 @@ def parse_extra_hosts(path: Path) -> list:
 def load_category_rules(path: Path) -> list:
     """~/.config/ssh-wiz/categories -> [(category, pattern, color|None), ...]."""
     rules = []
-    if not path.exists():
+    lines = _read_config_lines(path)
+    if lines is None:
         return rules
-    for raw in path.read_text().splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue

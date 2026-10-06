@@ -343,6 +343,43 @@ class RankHostsTest(TempPathsTestCase):
         self.assertEqual([h.name for h in out], ["mid", "alpha", "zeta"])
 
 
+class ConfigCacheTest(TempPathsTestCase):
+    def test_unchanged_file_is_not_reread(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        shw.parse_ssh_config(self.ssh_config)
+        orig = Path.read_text
+        with mock.patch.object(Path, "read_text", wraps=orig) as m:
+            shw.parse_ssh_config(self.ssh_config)
+        self.assertEqual(m.call_count, 0)  # served from the mtime cache
+
+    def test_modified_file_is_reread(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        _hosts, order = shw.parse_ssh_config(self.ssh_config)
+        self.assertEqual(order, ["alpha"])
+        self.ssh_config.write_text(
+            "Host alpha\n  User alice\nHost beta\n  User bob\n")
+        _hosts, order = shw.parse_ssh_config(self.ssh_config)
+        self.assertEqual(order, ["alpha", "beta"])
+
+    def test_missing_file_returns_empty_and_uncaches(self):
+        self.assertEqual(shw.parse_ssh_config(self.ssh_config), ({}, []))
+        self.assertNotIn(self.ssh_config, shw._CONFIG_CACHE)
+
+    def test_favorites_reread_after_toggle(self):
+        shw.toggle_favorite_file("alpha")
+        self.assertEqual(shw.load_favorites(), ["alpha"])
+        shw.toggle_favorite_file("alpha")
+        self.assertEqual(shw.load_favorites(), [])
+
+    def test_category_rules_reread_after_write(self):
+        self.categories.write_text("LAN  alpha\n")
+        self.assertEqual(shw.load_category_rules(self.categories),
+                         [("LAN", "alpha", None)])
+        self.categories.write_text("LAN  alpha  blue\nWORK  beta\n")
+        self.assertEqual(shw.load_category_rules(self.categories),
+                         [("LAN", "alpha", "blue"), ("WORK", "beta", None)])
+
+
 class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
     def write_hosts(self):
         self.ssh_config.write_text(
