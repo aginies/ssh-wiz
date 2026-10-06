@@ -349,6 +349,42 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             lines = str(wl.render()).splitlines()
             self.assertTrue(lines[-1].startswith("  h11"))
 
+    async def test_edit_categories_opens_editor_and_creates_file(self):
+        # no categories file yet: ^g must create it with the template header
+        self.ssh_config.write_text("Host alpha\n  User alice\nHost beta\n  User bob\n")
+        app = shw.SSHWiz()
+        with (
+            mock.patch.object(
+                shw.SSHWiz, "suspend", lambda self: contextlib.nullcontext()
+            ),
+            mock.patch.dict(os.environ, {"EDITOR": "vi"}),
+            mock.patch.object(shw.subprocess, "run") as run,
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("ctrl+g")
+        run.assert_called_once_with(["vi", str(self.categories)], check=False)
+        self.assertIn("ssh-wiz categories", self.categories.read_text())
+
+    async def test_edit_categories_reloads_tabs(self):
+        self.write_hosts()  # LAN alpha/gamma, WORK beta
+
+        def fake_editor(args, **_kw):
+            self.categories.write_text("LAN  alpha\nDB  beta\n")
+
+        app = shw.SSHWiz()
+        with (
+            mock.patch.object(
+                shw.SSHWiz, "suspend", lambda self: contextlib.nullcontext()
+            ),
+            mock.patch.dict(os.environ, {"EDITOR": "vi"}),
+            mock.patch.object(shw.subprocess, "run", side_effect=fake_editor),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("ctrl+g")
+                tabs = str(app.query_one("#tabs", shw.Static).render())
+        self.assertIn("DB", tabs)
+        self.assertNotIn("WORK", tabs)
+
 
 class BuildSshCmdTest(unittest.TestCase):
     def make_host(self, **kw):
@@ -557,6 +593,7 @@ class DemoTest(TempPathsTestCase):
         self.assertIn("alice@web1.example.com", text)
         self.assertIn("bob@web1.example.com", text)  # multi-user entry
         self.assertIn("buildbox", text)  # extra host
+        self.assertIn("TAILSCALE", text)  # 100.64.9.9 auto-categorized
         self.assertNotIn("realmarker", text)  # real config untouched
 
 

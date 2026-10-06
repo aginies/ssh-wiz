@@ -58,6 +58,7 @@ screenshots without exposing real infrastructure.
 | ^t | toggle tmux mode (`tmux new -A -s wiz-<host>`) |
 | ^y | copy the ssh command for the selected host |
 | ^e | open `~/.ssh/config` at the selected host (`$EDITOR`) |
+| ^g | open `~/.config/ssh-wiz/categories` (`$EDITOR`), then refresh |
 | ^r | refresh host list |
 | esc | clear filter |
 | ^q / ^c | quit |

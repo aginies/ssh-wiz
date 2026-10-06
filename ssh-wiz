@@ -30,6 +30,7 @@ TUI keys:
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
+  ^g        open ~/.config/ssh-wiz/categories ($EDITOR), then refresh
   ^r        refresh host list
   esc       clear filter
   ^q / ^c   quit
@@ -77,6 +78,24 @@ CATEGORIES_FILE = CONFIG_DIR / "categories"
 # (start_demo/stop_demo); the real config and state are never touched.
 _PATH_ATTRS = ("SSH_CONFIG", "CONFIG_DIR", "STATE_DIR", "FAVORITES_FILE",
                "USAGE_FILE", "EXTRA_HOSTS_FILE", "CATEGORIES_FILE")
+# Header written to a freshly created categories file (^g).
+CATEGORIES_TEMPLATE = """\
+# ssh-wiz categories — one rule per line:
+#
+#   <category>  <host pattern>  [color]
+#
+# - The first matching rule wins. Patterns are shell globs, matched
+#   case-sensitively against the host name (extra hosts: their alias).
+# - Hosts matching no rule go to OTHER.
+# - Bare IPs in 100.64.0.0/10 (Tailscale) are auto-categorized as
+#   TAILSCALE unless a rule matches first.
+# - Tab order follows first appearance. Without a color, categories get
+#   one from a fixed palette.
+#
+# Examples:
+#   LAN     10.0.1.*      magenta
+#   PROD    *.example.com
+"""
 DEMO = False      # demo mode active: sample data, no real connections
 _demo_saved = None  # path values before start_demo (restored by stop_demo)
 _demo_root = None   # demo temp dir
@@ -558,7 +577,7 @@ from textual.widget import Widget  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 
 HINTS = ("type: filter    ←→: cat    ↑↓: select    ⏎: connect    ^f: fav    "
-         "^o: passwd    ^t: tmux    ^y: copy    ^e: edit    "
+         "^o: passwd    ^t: tmux    ^y: copy    ^e: edit    ^g: cats    "
          "esc: clear    ^q: quit")
 
 
@@ -859,6 +878,24 @@ class SSHWiz(App):
             return
         self.reload()
 
+    def edit_categories(self) -> None:
+        """Open the categories file in $EDITOR, then reload (tabs, colors
+        and categorization rebuild). In demo mode the demo's temp file is
+        edited — safe, and a nice live demo of re-categorization."""
+        path = CATEGORIES_FILE
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(CATEGORIES_TEMPLATE)
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+        args = shlex.split(editor) + [str(path)]
+        try:
+            with self.suspend():
+                subprocess.run(args, check=False)
+        except SuspendNotSupported:
+            self.notify("terminal does not support suspend", severity="error")
+            return
+        self.reload()
+
     # -- keys
 
     def on_key(self, event: events.Key) -> None:
@@ -936,6 +973,9 @@ class SSHWiz(App):
             event.stop()
         elif key == "ctrl+e":
             self.edit_config()
+            event.stop()
+        elif key == "ctrl+g":
+            self.edit_categories()
             event.stop()
         elif key == "ctrl+r":
             self.reload()
@@ -1018,7 +1058,7 @@ complete -c ssh-wiz -n '__fish_seen_argument -s f -s p -s t' -a '(ssh-wiz --comp
 # Built-in sample data for --demo: obviously fake (RFC 2606 example.*
 # domains, TEST-NET-1 addresses), exercising every feature — categories,
 # multi-user hosts, GSSAPI principal, ports, identity files, extra hosts,
-# favorites and usage-based ranking.
+# favorites, usage-based ranking and Tailscale auto-categorization.
 DEMO_SSH_CONFIG = """\
 Host web1.example.com 10.0.0.11
     Port 2222
@@ -1048,6 +1088,9 @@ Host git.example.org
 
 Host kerberos.example.org
     User alice@EXAMPLE.ORG
+
+Host 100.64.9.9
+    User taylor
 
 Host bastion.example.net
     Port 2222
