@@ -1,4 +1,2 @@
-# Default rule set plus E402: the textual imports in ssh-wiz are
-# intentionally mid-file so the CLI paths (-l, -f, direct connect) start
-# without paying for the TUI dependency (see the comment above them).
-lint.extend-select = ["E402"]
+# Default rule set. (textual is imported inside _tui() rather than at
+# module level, so no E402 exception is needed.)

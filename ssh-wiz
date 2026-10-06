@@ -879,1193 +879,1231 @@ def find_config_line(name: str):
 
 # ------------------------------------------------------------------- TUI
 
-# Textual is imported here (not at the top) so the CLI paths (-l, -f, direct
-# connect) start without paying for the TUI dependency.
-from textual import events  # noqa: E402
-from textual.app import App, ComposeResult, SuspendNotSupported  # noqa: E402
-from textual.screen import ModalScreen, Screen  # noqa: E402
-from textual.widget import Widget  # noqa: E402
-from textual.containers import Container, Vertical  # noqa: E402
-from textual.widgets import ProgressBar, Static  # noqa: E402
+# Textual is imported only when the TUI actually starts (see _tui()):
+# the CLI paths (-l, -f, --complete, direct connect) must not pay for
+# the ~100 ms textual import. The TUI classes subclass textual classes
+# at definition time, so they are defined inside _tui() and rebound
+# onto this module (sshwiz.SSHWiz, shw.HostList, ...); the test suite
+# calls _tui() once before using them.
+_TUI = False
 
 
-def hints_text() -> str:
-    """Bottom-bar key hints; ^t is only shown when tmux is installed."""
-    parts = ["?/F1: help", "type: filter", "⏎: connect",
-             "^f: fav", "^o: opts"]
-    if tmux_available():
-        parts.append("^t: tmux")
-    parts += ["^y: copy", "^s: sync", "^e: edit", "^g: cats",
-              "esc: clear", "^q: quit"]
-    return "    ".join(parts)
+def _tui():
+    """Import textual and define the TUI classes (once); returns SSHWiz."""
+    global _TUI, hints_text, OPTIONS_HINTS, help_text, sync_help_text
+    global HelpScreen, ConfirmScreen, HostList, FileList, FileSyncScreen
+    global OptionsPanel, CmdLine, SSHWiz
+    global events, App, ComposeResult, SuspendNotSupported, ModalScreen
+    global Screen, Widget, Container, Vertical, ProgressBar, Static
+    if _TUI:
+        return SSHWiz
+    from textual import events
+    from textual.app import App, ComposeResult, SuspendNotSupported
+    from textual.containers import Container, Vertical
+    from textual.screen import ModalScreen, Screen
+    from textual.widget import Widget
+    from textual.widgets import ProgressBar, Static
+
+    def hints_text() -> str:
+        """Bottom-bar key hints; ^t is only shown when tmux is installed."""
+        parts = ["?/F1: help", "type: filter", "⏎: connect",
+                 "^f: fav", "^o: opts"]
+        if tmux_available():
+            parts.append("^t: tmux")
+        parts += ["^y: copy", "^s: sync", "^e: edit", "^g: cats",
+                  "esc: clear", "^q: quit"]
+        return "    ".join(parts)
 
 
-OPTIONS_HINTS = ("↑↓: select    ←→/⏎: value (off → v1 → … → off)    "
-                 "esc/^o: close    changes apply live")
+    OPTIONS_HINTS = ("↑↓: select    ←→/⏎: value (off → v1 → … → off)    "
+                     "esc/^o: close    changes apply live")
 
 
-def help_text() -> str:
-    lines = [
-        "ssh-wiz help",
-        "",
-        "  type        fuzzy-filter hosts (letters in order)",
-        "  ←/→         previous/next category (tab/shift-tab too)",
-        "  ↑/↓         move cursor (PgUp/PgDn, Home/End too)",
-        "  ⏎           connect to selected host",
-        "  ^f          toggle favorite for selected host",
-        "  ^o          ssh options panel (↑↓ select, ←→/⏎ cycle, esc close)",
-    ]
-    if tmux_available():
-        lines.append("  ^t          toggle tmux mode (tmux new -A -s wiz-<host>)")
-    lines += [
-        "  ^y          copy the ssh command for the selected host",
-        "  ^s          file-sync screen (twin-panel local -> remote)",
-        "  ^e          open ~/.ssh/config at the selected host",
-        "  ^g          open categories file, then refresh",
-        "  ^h          (terminals send backspace for ^h, so use ? / F1)",
-        "  ? / F1      this help",
-        "  ^r          refresh host list",
-        "  esc         clear filter / close panel",
-        "  ^q / ^c     quit",
-    ]
-    return "\n".join(lines) + "\n"
+    def help_text() -> str:
+        lines = [
+            "ssh-wiz help",
+            "",
+            "  type        fuzzy-filter hosts (letters in order)",
+            "  ←/→         previous/next category (tab/shift-tab too)",
+            "  ↑/↓         move cursor (PgUp/PgDn, Home/End too)",
+            "  ⏎           connect to selected host",
+            "  ^f          toggle favorite for selected host",
+            "  ^o          ssh options panel (↑↓ select, ←→/⏎ cycle, esc close)",
+        ]
+        if tmux_available():
+            lines.append("  ^t          toggle tmux mode (tmux new -A -s wiz-<host>)")
+        lines += [
+            "  ^y          copy the ssh command for the selected host",
+            "  ^s          file-sync screen (twin-panel local -> remote)",
+            "  ^e          open ~/.ssh/config at the selected host",
+            "  ^g          open categories file, then refresh",
+            "  ^h          (terminals send backspace for ^h, so use ? / F1)",
+            "  ? / F1      this help",
+            "  ^r          refresh host list",
+            "  esc         clear filter / close panel",
+            "  ^q / ^c     quit",
+        ]
+        return "\n".join(lines) + "\n"
 
 
-class HelpScreen(Screen):
-    """Full key help overlay; ^h opens, esc/^h/q closes. Modal: while
-    open it swallows every key (nothing falls through to the app)."""
-    CSS = """
-    HelpScreen {
-        align: center middle;
-    }
-    HelpScreen Static {
-        width: auto;
-        border: heavy $primary;
-        background: $surface;
-        padding: 1 2;
-    }
-    """
+    class HelpScreen(Screen):
+        """Full key help overlay; ^h opens, esc/^h/q closes. Modal: while
+        open it swallows every key (nothing falls through to the app)."""
+        CSS = """
+        HelpScreen {
+            align: center middle;
+        }
+        HelpScreen Static {
+            width: auto;
+            border: heavy $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        """
 
-    def __init__(self, body: str | None = None) -> None:
-        super().__init__()
-        self._help_body = body if body is not None else help_text()
+        def __init__(self, body: str | None = None) -> None:
+            super().__init__()
+            self._help_body = body if body is not None else help_text()
 
-    def compose(self) -> ComposeResult:
-        yield Static(self._help_body)
+        def compose(self) -> ComposeResult:
+            yield Static(self._help_body)
 
-    def on_key(self, event: events.Key) -> None:
-        if event.key in ("escape", "ctrl+h", "question_mark", "f1", "q"):
-            self.app.pop_screen()
-        event.stop()
-
-
-class ConfirmScreen(ModalScreen):
-    """Small yes/no prompt (modal: dims the screen, swallows every key).
-    y/enter = yes, n/esc/q = no; the answer is returned as the pop result."""
-    DEFAULT_CSS = """
-    ConfirmScreen {
-        align: center middle;
-    }
-    ConfirmScreen #confirm-box {
-        width: auto;
-        border: heavy $primary;
-        background: $surface;
-        padding: 1 2;
-    }
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__()
-        self._message = message
-
-    def compose(self) -> ComposeResult:
-        with Container(id="confirm-box"):
-            yield Static(self._message)
-            yield Static("  [bold yellow]y[/]es      [bold yellow]n[/]o  (esc = no)")
-
-    def on_key(self, event: events.Key) -> None:
-        if event.key in ("y", "enter"):
-            self.dismiss(True)
-        elif event.key in ("n", "escape", "q"):
-            self.dismiss(False)
-        event.stop()
-
-
-class HostList(Widget):
-    can_focus = True
-    DEFAULT_CSS = """
-    HostList {
-        width: 100%;
-        height: 1fr;
-    }
-    """
-
-    def __init__(self) -> None:
-        super().__init__(id="hostlist")
-        self.hosts: list = []
-        self.shown: list = []
-        self.favs: set = set()
-        self.cursor = 0
-        self.filter = ""
-        self.scroll = 0
-
-    def apply_filter(self) -> None:
-        f = self.filter.lower()
-        cat = self.app.current_cat
-        self.shown = [h for h in self.hosts
-                      if (cat == ALL_CATEGORY or h.category == cat)
-                      and (not f or fuzzy_match(f,
-                           (h.name + " " + h.display + " " +
-                            h.category).lower()))]
-        if cat == ALL_CATEGORY:
-            # triage: keep the favorites block, group the rest per category
-            self.shown = triage_hosts(self.shown, self.favs,
-                                      self.app.categories)
-        self.cursor = min(self.cursor, max(0, len(self.shown) - 1))
-        self.refresh()
-
-    def render(self) -> Text:
-        t = Text(no_wrap=True, end="")
-        height = max(1, self.size.height)
-        if not self.shown:
-            msg = ("no hosts match" if self.filter
-                   else "no hosts found — check ~/.ssh/config")
-            t.append(f"  {msg}", style="dim")
-            return t
-        # Layout: favorites block, a dim separator, then non-favorites
-        # grouped by category (ALL view) with a header per group. (The top
-        # line above the list is drawn by CmdLine.)
-        n_fav = favorite_split(self.shown, self.favs)
-        rows: list = []
-        rows.extend(("host", i) for i in range(n_fav))
-        if 0 < n_fav < len(self.shown):
-            rows.append(("sep", None))
-        prev_cat = None
-        for i in range(n_fav, len(self.shown)):
-            h = self.shown[i]
-            if self.app.current_cat == ALL_CATEGORY and h.category != prev_cat:
-                rows.append(("hdr", h.category))
-            rows.append(("host", i))
-            prev_cat = h.category
-        # Keep the cursor visible; when possible leave one row of lookahead
-        # below it (at the end of the list the cursor sits on the last row).
-        crow = rows.index(("host", self.cursor))
-        self.scroll = min(self.scroll, crow)
-        if crow >= self.scroll + height - 1:
-            self.scroll = crow - height + 2
-        self.scroll = max(0, self.scroll)
-        for r in range(self.scroll, min(len(rows), self.scroll + height)):
-            kind, ref = rows[r]
-            line = Text()
-            if kind == "sep":
-                line.append("─" * max(1, self.size.width), style="dim")
-            elif kind == "hdr":
-                label = f" {ref} "
-                line.append(label,
-                            style="bold " + self.app.cat_colors.get(ref, ""))
-                line.append("─" * max(0, self.size.width - len(label)),
-                            style="dim")
-            else:
-                h = self.shown[ref]
-                fav = h.name in self.favs
-                line.append("★ " if fav else "  ",
-                            style="yellow" if fav else "dim")
-                line.append(f"{(h.label or h.name):<32}", style="bold")
-                line.append(COL_SEP, style="dim")
-                _append_display(line, h)
-                if h.identityfile:
-                    line.append(" ")
-                    line.append(f"[{Path(h.identityfile).expanduser().name}]",
-                                style="cyan dim")
-                if ref == self.cursor:
-                    line.stylize("reverse")
-            t.append_text(line)
-            t.append("\n")
-        return t
-
-    def on_resize(self, event) -> None:
-        self.refresh()
-
-
-class FileList(Widget):
-    """A checkbox file list for the file-sync screen (local or remote). ↑↓
-    moves the cursor, space toggles selection. Rendered with a ☐/☑ column,
-    a name column and a dim size column; dirs are listed first, then A->Z.
-    Hidden ('dot') entries are hidden unless ``show_hidden`` is set (toggled
-    with ``h`` on the screen). The active panel is highlighted with reverse;
-    selection count lives in the screen's path bar."""
-    can_focus = True
-    DEFAULT_CSS = """
-    FileList {
-        width: 100%;
-        height: 1fr;
-    }
-    FileList.--active {
-        border-left: heavy $primary;
-    }
-    """
-
-    def __init__(self, title: str = "", wid: str | None = None) -> None:
-        super().__init__(id=wid)
-        self.title = title
-        self.entries: list = []
-        self.cursor = 0
-        self.scroll = 0
-        self.filter = ""
-        self.active = False
-        self.error: str | None = None
-        self.show_hidden = False
-
-    @property
-    def filtered(self) -> list:
-        """Visible entries (hidden ones excluded unless ``show_hidden``), then
-        fuzzy-matched against the current text filter."""
-        f = self.filter.lower()
-        rows = [e for e in self.entries if self.show_hidden or not e.hidden]
-        if not f:
-            return rows
-        return [e for e in rows if fuzzy_match(f, e.name.lower())]
-
-    def entry_at_cursor(self):
-        """The entry under the cursor, i.e. the *visible* row at
-        ``self.cursor``. The cursor indexes ``filtered`` (what is rendered),
-        never ``entries`` — hidden entries are not shown, so they must not be
-        addressable by space/F5/F8."""
-        rows = self.filtered
-        if not rows:
-            return None
-        if self.cursor >= len(rows):
-            self.cursor = len(rows) - 1
-        return rows[self.cursor]
-
-    def render(self) -> Text:
-        t = Text(end="")
-        rows = self.filtered
-        if not rows:
-            if self.title == "remote" and self.error:
-                t.append("  remote listing failed: ", style="dim red")
-                t.append(self.error.strip().splitlines()[-1], style="red")
-                return t
-            msg = "empty directory" if self.title == "local" else "loading…"
-            t.append(f"  {msg}", style="dim")
-            return t
-        name_w = min(45, max(14, max(len(e.name) for e in rows) + 2))
-        height = max(1, self.size.height)
-        if self.cursor >= len(rows):
-            self.cursor = len(rows) - 1
-        crow = self.cursor
-        self.scroll = min(self.scroll, crow)
-        if crow >= self.scroll + height - 1:
-            self.scroll = crow - height + 2
-        self.scroll = max(0, self.scroll)
-        for r in range(self.scroll, min(len(rows), self.scroll + height)):
-            e = rows[r]
-            box = "☑" if e.selected else "☐"
-            # The ☑/☐ icon is the selection indicator, so selected rows stay
-            # un-highlighted. The cursor row gets a *subtle* background (not the
-            # harsh white of reverse) so you always know where you are.
-            row_style = Style(bgcolor="#26405b") if r == self.cursor else Style()
-            name = e.name + ("/" if (e.is_dir and not e.is_symlink) else "")
-            line = Text()
-            line.append(f"{box} ", style=("green" if e.selected else "dim"))
-            line.append(f"{name:<{name_w}}", style=row_style)
-            if e.size:
-                line.append(fmt_size(e.size), style=row_style)
-            t.append_text(line)
-            t.append("\n")
-        return t
-
-    def on_resize(self, event) -> None:
-        self.refresh()
-
-
-def sync_help_text() -> str:
-    return "\n".join([
-        "file sync — Midnight Commander style",
-        "",
-        "  Tab        switch local / remote panel",
-        "  ↑/↓        move cursor",
-        "  enter/right  open directory",
-        "  left/back  go up one level",
-        "  space      toggle selection (☐ → ☑)",
-        "  h          show/hide hidden (.files)",
-        "  *          select all    /   select none",
-        "  F5 / c     copy selected local files -> remote",
-        "  ? / F1     this help",
-        "  esc / q    close",
-        "",
-        "  Local -> remote only. rsync must be installed on the",
-        "  remote host (key auth, no password).",
-    ])
-
-
-class FileSyncScreen(Screen):
-    """Twin-panel file manager (Midnight Commander style): the left panel is
-    the local filesystem, the right panel is the selected host's filesystem
-    (key auth only — no password prompt). Select items in the local panel and
-    press F5/c to push them into the remote panel's current directory.
-
-    Local -> remote only. Remote browsing and transfers use rsync, so rsync
-    must be installed on the remote host; otherwise the remote panel reports
-    the error and offers an scp fallback. Modal: while open it swallows every
-    key (nothing falls through to the app)."""
-    CSS = """
-    FileSyncScreen {
-        align: center middle;
-    }
-    #sync-root {
-        layout: horizontal;
-        width: 95%;
-        height: 1fr;
-        border: heavy $primary;
-        padding: 0 1;
-        background: $panel;
-    }
-    #left-col, #right-col {
-        layout: vertical;
-        width: 1fr;
-    }
-    #sync-sep {
-        width: 3;
-        height: 1fr;
-        background: $panel;
-        border-left: heavy $primary;
-        border-right: heavy $primary;
-    }
-    .pathbar {
-        height: 1;
-        background: $primary;
-        color: $text;
-        padding: 0 1;
-    }
-    #sync-status {
-        width: 95%;
-        margin-top: 1;
-        height: auto;
-        min-height: 7;
-        max-height: 14;
-        padding: 0 1;
-        background: $panel;
-        border: heavy $border;
-        overflow-y: auto;
-    }
-    #sync-help {
-        width: 95%;
-        margin-top: 1;
-        min-height: 2;
-        padding: 0 1;
-        background: $panel;
-        border: heavy $border;
-    }
-    #sync-progress {
-        width: 95%;
-        margin-top: 1;
-        margin-bottom: 1;
-        height: 2;
-    }
-    """
-
-    def __init__(self, host: Host) -> None:
-        super().__init__()
-        self.host = host
-        self.active = "local"
-        self.busy = False
-        self.local_path = str(Path.home())
-        self.remote_path = "~"
-        self.remote_error: str | None = None
-        self._transfer_proc = None
-        self._confirm_open = False
-        # probed remote rsync version (gates --info=progress2); None = unknown
-        self.remote_rsync: tuple | None = None
-        # live transfer stats (from --info=progress2, when supported)
-        self._xfer_bytes = 0
-        self._speed = 0.0
-        self._pct = 0
-        self._avg_speed = 0.0
-
-    def compose(self) -> ComposeResult:
-        with Container(id="sync-root"):
-            with Vertical(id="left-col"):
-                yield Static(" local", id="local-path", classes="pathbar")
-                yield FileList("local", "local-list")
-            yield Static("", id="sync-sep")
-            with Vertical(id="right-col"):
-                yield Static(" remote", id="remote-path", classes="pathbar")
-                yield FileList("remote", "remote-list")
-        yield ProgressBar(
-            id="sync-progress", total=0,
-            show_bar=True, show_percentage=True, show_eta=False,
-        )
-        yield Static("select files with space · F5 copy · F8 delete · h hidden · ? help",
-                     id="sync-status")
-        yield Static("", id="sync-help")
-
-    def on_mount(self) -> None:
-        local = self.query_one("#local-list", FileList)
-        remote = self.query_one("#remote-list", FileList)
-        local.entries = list_local_dir(Path(self.local_path))
-        local.active = True
-        remote.active = False
-        remote.error = None
-        local.focus()
-        self._refresh_bars()
-        self._refresh_help()
-        self.query_one("#sync-progress", ProgressBar).display = False
-        self.app.run_worker(self._load_remote())
-        self.app.run_worker(self._probe_remote_rsync())
-
-    async def _confirm_quit(self) -> None:
-        """Esc/q while a transfer runs: ask before killing it. The transfer
-        keeps going in the background while the dialog is open."""
-        try:
-            answer = await self.app.push_screen(
-                ConfirmScreen("Kill the in-progress transfer and quit?"),
-                wait_for_dismiss=True)
-            if answer:
-                if self._transfer_proc is not None:
-                    self._transfer_proc.kill()
+        def on_key(self, event: events.Key) -> None:
+            if event.key in ("escape", "ctrl+h", "question_mark", "f1", "q"):
                 self.app.pop_screen()
-        finally:
+            event.stop()
+
+
+    class ConfirmScreen(ModalScreen):
+        """Small yes/no prompt (modal: dims the screen, swallows every key).
+        y/enter = yes, n/esc/q = no; the answer is returned as the pop result."""
+        DEFAULT_CSS = """
+        ConfirmScreen {
+            align: center middle;
+        }
+        ConfirmScreen #confirm-box {
+            width: auto;
+            border: heavy $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        """
+
+        def __init__(self, message: str) -> None:
+            super().__init__()
+            self._message = message
+
+        def compose(self) -> ComposeResult:
+            with Container(id="confirm-box"):
+                yield Static(self._message)
+                yield Static("  [bold yellow]y[/]es      [bold yellow]n[/]o  (esc = no)")
+
+        def on_key(self, event: events.Key) -> None:
+            if event.key in ("y", "enter"):
+                self.dismiss(True)
+            elif event.key in ("n", "escape", "q"):
+                self.dismiss(False)
+            event.stop()
+
+
+    class HostList(Widget):
+        can_focus = True
+        DEFAULT_CSS = """
+        HostList {
+            width: 100%;
+            height: 1fr;
+        }
+        """
+
+        def __init__(self) -> None:
+            super().__init__(id="hostlist")
+            self.hosts: list = []
+            self.shown: list = []
+            self.favs: set = set()
+            self.cursor = 0
+            self.filter = ""
+            self.scroll = 0
+
+        def apply_filter(self) -> None:
+            f = self.filter.lower()
+            cat = self.app.current_cat
+            self.shown = [h for h in self.hosts
+                          if (cat == ALL_CATEGORY or h.category == cat)
+                          and (not f or fuzzy_match(f,
+                               (h.name + " " + h.display + " " +
+                                h.category).lower()))]
+            if cat == ALL_CATEGORY:
+                # triage: keep the favorites block, group the rest per category
+                self.shown = triage_hosts(self.shown, self.favs,
+                                          self.app.categories)
+            self.cursor = min(self.cursor, max(0, len(self.shown) - 1))
+            self.refresh()
+
+        def render(self) -> Text:
+            t = Text(no_wrap=True, end="")
+            height = max(1, self.size.height)
+            if not self.shown:
+                msg = ("no hosts match" if self.filter
+                       else "no hosts found — check ~/.ssh/config")
+                t.append(f"  {msg}", style="dim")
+                return t
+            # Layout: favorites block, a dim separator, then non-favorites
+            # grouped by category (ALL view) with a header per group. (The top
+            # line above the list is drawn by CmdLine.)
+            n_fav = favorite_split(self.shown, self.favs)
+            rows: list = []
+            rows.extend(("host", i) for i in range(n_fav))
+            if 0 < n_fav < len(self.shown):
+                rows.append(("sep", None))
+            prev_cat = None
+            for i in range(n_fav, len(self.shown)):
+                h = self.shown[i]
+                if self.app.current_cat == ALL_CATEGORY and h.category != prev_cat:
+                    rows.append(("hdr", h.category))
+                rows.append(("host", i))
+                prev_cat = h.category
+            # Keep the cursor visible; when possible leave one row of lookahead
+            # below it (at the end of the list the cursor sits on the last row).
+            crow = rows.index(("host", self.cursor))
+            self.scroll = min(self.scroll, crow)
+            if crow >= self.scroll + height - 1:
+                self.scroll = crow - height + 2
+            self.scroll = max(0, self.scroll)
+            for r in range(self.scroll, min(len(rows), self.scroll + height)):
+                kind, ref = rows[r]
+                line = Text()
+                if kind == "sep":
+                    line.append("─" * max(1, self.size.width), style="dim")
+                elif kind == "hdr":
+                    label = f" {ref} "
+                    line.append(label,
+                                style="bold " + self.app.cat_colors.get(ref, ""))
+                    line.append("─" * max(0, self.size.width - len(label)),
+                                style="dim")
+                else:
+                    h = self.shown[ref]
+                    fav = h.name in self.favs
+                    line.append("★ " if fav else "  ",
+                                style="yellow" if fav else "dim")
+                    line.append(f"{(h.label or h.name):<32}", style="bold")
+                    line.append(COL_SEP, style="dim")
+                    _append_display(line, h)
+                    if h.identityfile:
+                        line.append(" ")
+                        line.append(f"[{Path(h.identityfile).expanduser().name}]",
+                                    style="cyan dim")
+                    if ref == self.cursor:
+                        line.stylize("reverse")
+                t.append_text(line)
+                t.append("\n")
+            return t
+
+        def on_resize(self, event) -> None:
+            self.refresh()
+
+
+    class FileList(Widget):
+        """A checkbox file list for the file-sync screen (local or remote). ↑↓
+        moves the cursor, space toggles selection. Rendered with a ☐/☑ column,
+        a name column and a dim size column; dirs are listed first, then A->Z.
+        Hidden ('dot') entries are hidden unless ``show_hidden`` is set (toggled
+        with ``h`` on the screen). The active panel is highlighted with reverse;
+        selection count lives in the screen's path bar."""
+        can_focus = True
+        DEFAULT_CSS = """
+        FileList {
+            width: 100%;
+            height: 1fr;
+        }
+        FileList.--active {
+            border-left: heavy $primary;
+        }
+        """
+
+        def __init__(self, title: str = "", wid: str | None = None) -> None:
+            super().__init__(id=wid)
+            self.title = title
+            self.entries: list = []
+            self.cursor = 0
+            self.scroll = 0
+            self.filter = ""
+            self.active = False
+            self.error: str | None = None
+            self.show_hidden = False
+
+        @property
+        def filtered(self) -> list:
+            """Visible entries (hidden ones excluded unless ``show_hidden``), then
+            fuzzy-matched against the current text filter."""
+            f = self.filter.lower()
+            rows = [e for e in self.entries if self.show_hidden or not e.hidden]
+            if not f:
+                return rows
+            return [e for e in rows if fuzzy_match(f, e.name.lower())]
+
+        def entry_at_cursor(self):
+            """The entry under the cursor, i.e. the *visible* row at
+            ``self.cursor``. The cursor indexes ``filtered`` (what is rendered),
+            never ``entries`` — hidden entries are not shown, so they must not be
+            addressable by space/F5/F8."""
+            rows = self.filtered
+            if not rows:
+                return None
+            if self.cursor >= len(rows):
+                self.cursor = len(rows) - 1
+            return rows[self.cursor]
+
+        def render(self) -> Text:
+            t = Text(end="")
+            rows = self.filtered
+            if not rows:
+                if self.title == "remote" and self.error:
+                    t.append("  remote listing failed: ", style="dim red")
+                    t.append(self.error.strip().splitlines()[-1], style="red")
+                    return t
+                msg = "empty directory" if self.title == "local" else "loading…"
+                t.append(f"  {msg}", style="dim")
+                return t
+            name_w = min(45, max(14, max(len(e.name) for e in rows) + 2))
+            height = max(1, self.size.height)
+            if self.cursor >= len(rows):
+                self.cursor = len(rows) - 1
+            crow = self.cursor
+            self.scroll = min(self.scroll, crow)
+            if crow >= self.scroll + height - 1:
+                self.scroll = crow - height + 2
+            self.scroll = max(0, self.scroll)
+            for r in range(self.scroll, min(len(rows), self.scroll + height)):
+                e = rows[r]
+                box = "☑" if e.selected else "☐"
+                # The ☑/☐ icon is the selection indicator, so selected rows stay
+                # un-highlighted. The cursor row gets a *subtle* background (not the
+                # harsh white of reverse) so you always know where you are.
+                row_style = Style(bgcolor="#26405b") if r == self.cursor else Style()
+                name = e.name + ("/" if (e.is_dir and not e.is_symlink) else "")
+                line = Text()
+                line.append(f"{box} ", style=("green" if e.selected else "dim"))
+                line.append(f"{name:<{name_w}}", style=row_style)
+                if e.size:
+                    line.append(fmt_size(e.size), style=row_style)
+                t.append_text(line)
+                t.append("\n")
+            return t
+
+        def on_resize(self, event) -> None:
+            self.refresh()
+
+
+    def sync_help_text() -> str:
+        return "\n".join([
+            "file sync — Midnight Commander style",
+            "",
+            "  Tab        switch local / remote panel",
+            "  ↑/↓        move cursor",
+            "  enter/right  open directory",
+            "  left/back  go up one level",
+            "  space      toggle selection (☐ → ☑)",
+            "  h          show/hide hidden (.files)",
+            "  *          select all    /   select none",
+            "  F5 / c     copy selected local files -> remote",
+            "  ? / F1     this help",
+            "  esc / q    close",
+            "",
+            "  Local -> remote only. rsync must be installed on the",
+            "  remote host (key auth, no password).",
+        ])
+
+
+    class FileSyncScreen(Screen):
+        """Twin-panel file manager (Midnight Commander style): the left panel is
+        the local filesystem, the right panel is the selected host's filesystem
+        (key auth only — no password prompt). Select items in the local panel and
+        press F5/c to push them into the remote panel's current directory.
+
+        Local -> remote only. Remote browsing and transfers use rsync, so rsync
+        must be installed on the remote host; otherwise the remote panel reports
+        the error and offers an scp fallback. Modal: while open it swallows every
+        key (nothing falls through to the app)."""
+        CSS = """
+        FileSyncScreen {
+            align: center middle;
+        }
+        #sync-root {
+            layout: horizontal;
+            width: 95%;
+            height: 1fr;
+            border: heavy $primary;
+            padding: 0 1;
+            background: $panel;
+        }
+        #left-col, #right-col {
+            layout: vertical;
+            width: 1fr;
+        }
+        #sync-sep {
+            width: 3;
+            height: 1fr;
+            background: $panel;
+            border-left: heavy $primary;
+            border-right: heavy $primary;
+        }
+        .pathbar {
+            height: 1;
+            background: $primary;
+            color: $text;
+            padding: 0 1;
+        }
+        #sync-status {
+            width: 95%;
+            margin-top: 1;
+            height: auto;
+            min-height: 7;
+            max-height: 14;
+            padding: 0 1;
+            background: $panel;
+            border: heavy $border;
+            overflow-y: auto;
+        }
+        #sync-help {
+            width: 95%;
+            margin-top: 1;
+            min-height: 2;
+            padding: 0 1;
+            background: $panel;
+            border: heavy $border;
+        }
+        #sync-progress {
+            width: 95%;
+            margin-top: 1;
+            margin-bottom: 1;
+            height: 2;
+        }
+        """
+
+        def __init__(self, host: Host) -> None:
+            super().__init__()
+            self.host = host
+            self.active = "local"
+            self.busy = False
+            self.local_path = str(Path.home())
+            self.remote_path = "~"
+            self.remote_error: str | None = None
+            self._transfer_proc = None
             self._confirm_open = False
+            # probed remote rsync version (gates --info=progress2); None = unknown
+            self.remote_rsync: tuple | None = None
+            # live transfer stats (from --info=progress2, when supported)
+            self._xfer_bytes = 0
+            self._speed = 0.0
+            self._pct = 0
+            self._avg_speed = 0.0
 
-    async def _probe_remote_rsync(self) -> None:
-        """Probe the remote rsync version once (gates --info=progress2, which
-        rsync < 3.1 may reject). Never blocks the screen: on any failure the
-        version stays None and transfers simply omit the flag."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *_rsync_ssh_shell(self.host).split(), self.host.target,
-                "rsync", "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL)
-            out, _ = await proc.communicate()
-        except (FileNotFoundError, OSError):
-            self.remote_rsync = None
-            return
-        m = _RSYNC_VER_RE.search(out.decode(errors="replace"))
-        self.remote_rsync = tuple(int(x) for x in m.groups()) if m else None
+        def compose(self) -> ComposeResult:
+            with Container(id="sync-root"):
+                with Vertical(id="left-col"):
+                    yield Static(" local", id="local-path", classes="pathbar")
+                    yield FileList("local", "local-list")
+                yield Static("", id="sync-sep")
+                with Vertical(id="right-col"):
+                    yield Static(" remote", id="remote-path", classes="pathbar")
+                    yield FileList("remote", "remote-list")
+            yield ProgressBar(
+                id="sync-progress", total=0,
+                show_bar=True, show_percentage=True, show_eta=False,
+            )
+            yield Static("select files with space · F5 copy · F8 delete · h hidden · ? help",
+                         id="sync-status")
+            yield Static("", id="sync-help")
 
-    # -- panels / path bars
-
-    def _active_list(self) -> FileList:
-        return self.query_one(
-            "#local-list" if self.active == "local" else "#remote-list",
-            FileList)
-
-    def _refresh_bars(self) -> None:
-        local = self.query_one("#local-list", FileList)
-        remote = self.query_one("#remote-list", FileList)
-        n_local = sum(1 for e in local.entries if e.selected)
-        n_remote = sum(1 for e in remote.entries if e.selected)
-        marker = " [dim](hidden)[/]" if local.show_hidden else ""
-        self.query_one("#local-path", Static).update(
-            f" local  {self.local_path}   [bold]{n_local} selected[/]{marker}")
-        err = f"  [red]✗ {self.remote_error}[/]" if self.remote_error else ""
-        self.query_one("#remote-path", Static).update(
-            f" remote  {self.host.display}  {self.remote_path}{err}   "
-            f"[bold]{n_remote} selected[/]")
-
-    # -- navigation
-
-    def _switch_panel(self) -> None:
-        self.active = "remote" if self.active == "local" else "local"
-        want = "#local-list" if self.active == "local" else "#remote-list"
-        for _id in ("#local-list", "#remote-list"):
-            self.query_one(_id, FileList).active = (_id == want)
-        self._active_list().focus()
-        self._refresh_bars()
-
-    def _open_dir(self) -> None:
-        lst = self._active_list()
-        e = lst.entry_at_cursor()
-        if e is None or not e.is_dir:
-            return
-        if self.active == "local":
-            self.local_path = e.path
-            lst.entries = list_local_dir(Path(self.local_path))
-        else:
-            self.remote_path = self.remote_path.rstrip("/") + "/" + e.name
+        def on_mount(self) -> None:
+            local = self.query_one("#local-list", FileList)
+            remote = self.query_one("#remote-list", FileList)
+            local.entries = list_local_dir(Path(self.local_path))
+            local.active = True
+            remote.active = False
+            remote.error = None
+            local.focus()
+            self._refresh_bars()
+            self._refresh_help()
+            self.query_one("#sync-progress", ProgressBar).display = False
             self.app.run_worker(self._load_remote())
-        lst.cursor, lst.scroll = 0, 0
-        lst.refresh()
-        self._refresh_bars()
+            self.app.run_worker(self._probe_remote_rsync())
 
-    def _go_up(self) -> None:
-        lst = self._active_list()
-        if self.active == "local":
-            self.local_path = str(Path(self.local_path).parent)
-            lst.entries = list_local_dir(Path(self.local_path))
-        else:
-            rp = self.remote_path.rstrip("/")
-            self.remote_path = rp.rsplit("/", 1)[0] if "/" in rp else ""
-            self.app.run_worker(self._load_remote())
-        lst.cursor, lst.scroll = 0, 0
-        lst.refresh()
-        self._refresh_bars()
+        async def _confirm_quit(self) -> None:
+            """Esc/q while a transfer runs: ask before killing it. The transfer
+            keeps going in the background while the dialog is open."""
+            try:
+                answer = await self.app.push_screen(
+                    ConfirmScreen("Kill the in-progress transfer and quit?"),
+                    wait_for_dismiss=True)
+                if answer:
+                    if self._transfer_proc is not None:
+                        self._transfer_proc.kill()
+                    self.app.pop_screen()
+            finally:
+                self._confirm_open = False
 
-    # -- hidden files
+        async def _probe_remote_rsync(self) -> None:
+            """Probe the remote rsync version once (gates --info=progress2, which
+            rsync < 3.1 may reject). Never blocks the screen: on any failure the
+            version stays None and transfers simply omit the flag."""
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *_rsync_ssh_shell(self.host).split(), self.host.target,
+                    "rsync", "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                out, _ = await proc.communicate()
+            except (FileNotFoundError, OSError):
+                self.remote_rsync = None
+                return
+            m = _RSYNC_VER_RE.search(out.decode(errors="replace"))
+            self.remote_rsync = tuple(int(x) for x in m.groups()) if m else None
 
-    def _toggle_hidden(self) -> None:
-        """Show or hide hidden ('dot') files and directories in both panels."""
-        local = self.query_one("#local-list", FileList)
-        state = not local.show_hidden
-        for wid in ("#local-list", "#remote-list"):
-            lst = self.query_one(wid, FileList)
-            lst.show_hidden = state
-            lst.refresh()
-        self._update_status(
-            "hidden files shown" if state else "hidden files hidden")
-        self._refresh_bars()
+        # -- panels / path bars
 
-    # -- selection
+        def _active_list(self) -> FileList:
+            return self.query_one(
+                "#local-list" if self.active == "local" else "#remote-list",
+                FileList)
 
-    def _toggle_select(self) -> None:
-        lst = self._active_list()
-        e = lst.entry_at_cursor()
-        if e is not None:
-            e.selected = not e.selected
+        def _refresh_bars(self) -> None:
+            local = self.query_one("#local-list", FileList)
+            remote = self.query_one("#remote-list", FileList)
+            n_local = sum(1 for e in local.entries if e.selected)
+            n_remote = sum(1 for e in remote.entries if e.selected)
+            marker = " [dim](hidden)[/]" if local.show_hidden else ""
+            self.query_one("#local-path", Static).update(
+                f" local  {self.local_path}   [bold]{n_local} selected[/]{marker}")
+            err = f"  [red]✗ {self.remote_error}[/]" if self.remote_error else ""
+            self.query_one("#remote-path", Static).update(
+                f" remote  {self.host.display}  {self.remote_path}{err}   "
+                f"[bold]{n_remote} selected[/]")
+
+        # -- navigation
+
+        def _switch_panel(self) -> None:
+            self.active = "remote" if self.active == "local" else "local"
+            want = "#local-list" if self.active == "local" else "#remote-list"
+            for _id in ("#local-list", "#remote-list"):
+                self.query_one(_id, FileList).active = (_id == want)
+            self._active_list().focus()
+            self._refresh_bars()
+
+        def _open_dir(self) -> None:
+            lst = self._active_list()
+            e = lst.entry_at_cursor()
+            if e is None or not e.is_dir:
+                return
+            if self.active == "local":
+                self.local_path = e.path
+                lst.entries = list_local_dir(Path(self.local_path))
+            else:
+                self.remote_path = self.remote_path.rstrip("/") + "/" + e.name
+                self.app.run_worker(self._load_remote())
+            lst.cursor, lst.scroll = 0, 0
             lst.refresh()
             self._refresh_bars()
 
-    def _select_all(self, on: bool) -> None:
-        lst = self._active_list()
-        for e in lst.filtered:  # only what is visible can be selected
-            e.selected = on
-        lst.refresh()
-        self._refresh_bars()
+        def _go_up(self) -> None:
+            lst = self._active_list()
+            if self.active == "local":
+                self.local_path = str(Path(self.local_path).parent)
+                lst.entries = list_local_dir(Path(self.local_path))
+            else:
+                rp = self.remote_path.rstrip("/")
+                self.remote_path = rp.rsplit("/", 1)[0] if "/" in rp else ""
+                self.app.run_worker(self._load_remote())
+            lst.cursor, lst.scroll = 0, 0
+            lst.refresh()
+            self._refresh_bars()
 
-    # -- remote listing
+        # -- hidden files
 
-    async def _load_remote(self) -> None:
-        remote = self.query_one("#remote-list", FileList)
-        url = f"{self.host.target}:{self.remote_path.rstrip('/')}/"
-        cmd = ["rsync", "--list-only", "-h", "-e", _rsync_ssh_shell(self.host), url]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out, err = await proc.communicate()
-        except FileNotFoundError:
-            remote.error = "rsync is not installed locally"
-            self.remote_error = remote.error
-            remote.entries = []
+        def _toggle_hidden(self) -> None:
+            """Show or hide hidden ('dot') files and directories in both panels."""
+            local = self.query_one("#local-list", FileList)
+            state = not local.show_hidden
+            for wid in ("#local-list", "#remote-list"):
+                lst = self.query_one(wid, FileList)
+                lst.show_hidden = state
+                lst.refresh()
+            self._update_status(
+                "hidden files shown" if state else "hidden files hidden")
+            self._refresh_bars()
+
+        # -- selection
+
+        def _toggle_select(self) -> None:
+            lst = self._active_list()
+            e = lst.entry_at_cursor()
+            if e is not None:
+                e.selected = not e.selected
+                lst.refresh()
+                self._refresh_bars()
+
+        def _select_all(self, on: bool) -> None:
+            lst = self._active_list()
+            for e in lst.filtered:  # only what is visible can be selected
+                e.selected = on
+            lst.refresh()
+            self._refresh_bars()
+
+        # -- remote listing
+
+        async def _load_remote(self) -> None:
+            remote = self.query_one("#remote-list", FileList)
+            url = f"{self.host.target}:{self.remote_path.rstrip('/')}/"
+            cmd = ["rsync", "--list-only", "-h", "-e", _rsync_ssh_shell(self.host), url]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await proc.communicate()
+            except FileNotFoundError:
+                remote.error = "rsync is not installed locally"
+                self.remote_error = remote.error
+                remote.entries = []
+                remote.cursor, remote.scroll = 0, 0
+                remote.refresh()
+                self._refresh_bars()
+                return
+            if proc.returncode != 0:
+                detail = err.decode(errors="replace").strip()
+                remote.error = detail or f"rsync exited {proc.returncode}"
+                self.remote_error = remote.error
+                remote.entries = []
+            else:
+                remote.error = None
+                self.remote_error = None
+                remote.entries = parse_rsync_listing(out.decode(errors="replace"))
             remote.cursor, remote.scroll = 0, 0
             remote.refresh()
             self._refresh_bars()
-            return
-        if proc.returncode != 0:
-            detail = err.decode(errors="replace").strip()
-            remote.error = detail or f"rsync exited {proc.returncode}"
-            self.remote_error = remote.error
-            remote.entries = []
-        else:
-            remote.error = None
-            self.remote_error = None
-            remote.entries = parse_rsync_listing(out.decode(errors="replace"))
-        remote.cursor, remote.scroll = 0, 0
-        remote.refresh()
-        self._refresh_bars()
 
-    # -- transfer
+        # -- transfer
 
-    def do_copy(self) -> None:
-        local = self.query_one("#local-list", FileList)
-        selected = [e for e in local.entries if e.selected]
-        if not selected:
-            self.app.notify("nothing selected — mark files with space",
-                            title="sync", severity="warning")
-            return
-        if DEMO:
-            cmd = " ".join(build_transfer_cmd(
-                self.host, self.app.enabled_options(), "up",
-                [e.path for e in selected], self.remote_path))
-            self.app.notify(f"demo mode — would run:\n{cmd}", title="sync")
-            return
-        self.busy = True
-        self._set_progress(0, len(selected), "transferring…")
-        self._update_status(
-            f"⏳ transferring {len(selected)} item(s) → "
-            f"{self.host.display}:{self.remote_path}…")
-        # live bandwidth needs --info=progress2: rsync >= 3.1 on BOTH ends
-        progress = (local_rsync_version() or (0,)) >= (3, 1, 0) and \
-            (self.remote_rsync or (0,)) >= (3, 1, 0)
-        cmd = build_transfer_cmd(
-            self.host, self.app.enabled_options(), "up",
-            [e.path for e in selected], self.remote_path,
-            progress=progress)
-        self.app.run_worker(self._run_sync(cmd, len(selected), progress))
-
-    # The status box is max-height: 14, so keep only this many itemize
-    # lines for display (older ones are counted, not rendered); live
-    # progress re-renders are throttled to ~4 Hz.
-    _MAX_STATUS_ITEMS = 30
-    _RENDER_INTERVAL = 0.25
-
-    async def _run_sync(self, cmd: list, total: int, progress: bool) -> None:
-        done = 0
-        items: list = []  # last _MAX_STATUS_ITEMS itemize lines (display)
-        counts = {"f": 0, "d": 0, "=": 0}  # totals over the whole transfer
-        n_items = 0
-        self._xfer_bytes = 0
-        self._speed = 0.0
-        self._pct = 0
-        self._avg_speed = 0.0
-        t0 = time.monotonic()
-        last_render = 0.0
-
-        def feed(segment: str) -> None:
-            """Consume one \n-delimited segment of rsync stdout. With
-            --info=progress2 a segment may hold an itemize line, a progress
-            sample, or both (progress updates are \r-separated and can glue
-            onto the next line), so each \r-part is tried against both."""
-            nonlocal done, n_items, last_render
-            for part in segment.split("\r"):
-                it = parse_itemize(part)
-                if it:
-                    n_items += 1
-                    counts[it[0]] += 1
-                    items.append(it)
-                    if len(items) > self._MAX_STATUS_ITEMS:
-                        items.pop(0)
-                    if not progress:  # without progress2, -i lines arrive on
-                        done += 1     # completion; with it, they arrive on
-                                      # start, so xfr# below counts instead
-                if progress:
-                    pg = parse_progress(part)
-                    if pg:
-                        b, pct, speed, xfr = pg
-                        self._xfer_bytes = b
-                        self._pct = pct
-                        self._speed = speed
-                        if xfr is not None:
-                            done = xfr
-                        # progress samples arrive continuously; re-rendering
-                        # the status box on every one is O(n^2) over a big
-                        # transfer, so throttle to ~4 Hz
-                        now = time.monotonic()
-                        if now - last_render >= self._RENDER_INTERVAL:
-                            last_render = now
-                            self._render_sync_status(items, done, total,
-                                                     "transferring…", None,
-                                                     counts, n_items)
-
-        try:
-            # LC_ALL=C: stable number format in progress samples (some
-            # locales use ',' decimals / lakh grouping)
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "LC_ALL": "C"},
-            )
-            self._transfer_proc = proc
-            err_task = asyncio.create_task(proc.stderr.read())
-            buf = ""
-            while True:
-                chunk = await proc.stdout.read(65536)
-                if not chunk:
-                    break
-                buf += chunk.decode(errors="replace")
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    feed(line)
-                if buf:  # in-progress tail (live \r updates)
-                    feed(buf)
-                    buf = ""
-            await proc.wait()
-            err = await err_task
-        except FileNotFoundError:
-            # no rsync locally: report it, and let the finally below clear
-            # self.busy or the screen would swallow every key but escape
-            self._render_sync_status([], 0, 0, None,
-                                     "rsync is not installed locally")
-            self.app.notify("rsync is not installed locally — install it "
-                            "to use file sync", title="sync",
-                            severity="error")
-            return
-        finally:
-            self._transfer_proc = None
-            self.busy = False
-        if not self.is_mounted:
-            return  # screen closed (e.g. transfer killed + quit)
-        elapsed = time.monotonic() - t0
-        if elapsed > 0 and self._xfer_bytes:
-            self._avg_speed = self._xfer_bytes / elapsed
-        if proc.returncode != 0 and not items:
-            self._render_sync_status([], 0, 0, None,
-                                     "rsync failed on the remote host")
-            self.app.notify("transfer failed — is rsync installed on the "
-                            f"remote host ({self.host.display})?",
-                            title="sync", severity="error")
-            return
-        self._render_sync_status(items, done, total, "done", None,
-                                 counts, n_items)
-        # refresh the remote panel so what just arrived is visible
-        self.app.run_worker(self._load_remote())
-        local = self.query_one("#local-list", FileList)
-        for e in local.entries:
-            e.selected = False
-        local.refresh()
-
-    def _render_sync_status(self, items, done, total, state, error,
-                            counts=None, n_items=None) -> None:
-        self._set_progress(done, total, state)
-        status = self.query_one("#sync-status", Static)
-        t = Text(end="")
-        if error:
-            t.append("  transfer failed:\n", style="bold red")
-            for line in error.strip().splitlines()[:10]:
-                t.append(f"  {line}\n", style="red")
-            status.update(t)
-            return
-        if counts is None:  # called without item data (error/idle paths)
-            counts = {"f": 0, "d": 0, "=": 0}
-            for ty, _name in items:
-                counts[ty] = counts.get(ty, 0) + 1
-        files, dirs, syms = counts["f"], counts["d"], counts["="]
-        hidden = (n_items - len(items)) if n_items is not None else 0
-        if state == "done":
-            t.append(f" ✓ done  {files} file(s), {dirs} dir(s)",
-                     style="bold green")
-            if syms:
-                t.append(f", {syms} symlink(s)", style="bold cyan")
-            if self._avg_speed > 0:
-                t.append(f"  ·  avg {fmt_speed(self._avg_speed)}",
-                         style="dim")
-        else:
-            t.append(f" ⏳ {state} {done}/{total}…", style="bold cyan")
-            if self._speed > 0:
-                t.append(f"  ·  {fmt_speed(self._speed)}", style="dim")
-            if self._pct:
-                t.append(f"  ·  {self._pct}%", style="dim")
-        t.append("\n")
-        if hidden:
-            t.append(f"  … {hidden} earlier item(s) not shown\n", style="dim")
-        for ty, name in items:
-            if ty == "f":
-                t.append(f"  → {name}\n", style="green")
-            elif ty == "d":
-                t.append(f"  ↗ {name}/\n", style="dim")
-            else:
-                t.append(f"  ↷ {name}\n", style="cyan")
-        status.update(t)
-
-    def _update_status(self, text: str) -> None:
-        self.query_one("#sync-status", Static).update(Text(text))
-
-    def _set_progress(self, done: int, total: int, state: str) -> None:
-        """Show and update the transfer progress bar.
-
-        The bar is hidden unless a transfer is in progress (``state`` is
-        ``"transferring…"``) or just finished (``"done"``); otherwise (error or
-        idle) it is hidden so it does not sit empty at the bottom of the screen.
-        """
-        bar = self.query_one("#sync-progress", ProgressBar)
-        if state in ("transferring…", "done"):
-            bar.display = True
-            bar.update(total=total, progress=min(done, total))
-        else:
-            bar.display = False
-
-    def _refresh_help(self) -> None:
-        """Render the shortcut legend shown at the bottom of the screen."""
-        bar = self.query_one("#sync-help", Static)
-        t = Text(end="")
-        for row in (
-            [("space", "select"), ("*", "all"), ("/", "none"),
-             ("h", "hidden"), ("↵", "open"), ("←", "up")],
-            [("F5/c", "copy"), ("F8", "delete"),
-             ("?/F1", "help"), ("esc", "close")],
-        ):
-            for key, action in row:
-                t.append(f"  {key:<6}", style="bold yellow")
-                t.append(f"{action}  ", style="dim")
-            t.append("\n")
-        t.rstrip()
-        bar.update(t)
-
-    # -- delete (F8)
-
-    async def _delete_selected(self) -> None:
-        """F8: ask for confirmation, then delete the entry under the cursor.
-        A directory's contents go with it, so the prompt says so."""
-        lst = self._active_list()
-        e = lst.entry_at_cursor()
-        if e is None:
-            return
-        if e.name:
-            if e.is_dir and not e.is_symlink:
-                msg = f"Delete {e.name}/ and all its contents?"
-            else:
-                msg = f"Delete {e.name}?"
-            answer = await self.app.push_screen(
-                ConfirmScreen(msg), wait_for_dismiss=True)
-            if not answer:
+        def do_copy(self) -> None:
+            local = self.query_one("#local-list", FileList)
+            selected = [e for e in local.entries if e.selected]
+            if not selected:
+                self.app.notify("nothing selected — mark files with space",
+                                title="sync", severity="warning")
                 return
-        if self.active == "local":
-            self._delete_local(e)
-        else:
-            self.app.run_worker(self._delete_remote(e))
+            if DEMO:
+                cmd = " ".join(build_transfer_cmd(
+                    self.host, self.app.enabled_options(), "up",
+                    [e.path for e in selected], self.remote_path))
+                self.app.notify(f"demo mode — would run:\n{cmd}", title="sync")
+                return
+            self.busy = True
+            self._set_progress(0, len(selected), "transferring…")
+            self._update_status(
+                f"⏳ transferring {len(selected)} item(s) → "
+                f"{self.host.display}:{self.remote_path}…")
+            # live bandwidth needs --info=progress2: rsync >= 3.1 on BOTH ends
+            progress = (local_rsync_version() or (0,)) >= (3, 1, 0) and \
+                (self.remote_rsync or (0,)) >= (3, 1, 0)
+            cmd = build_transfer_cmd(
+                self.host, self.app.enabled_options(), "up",
+                [e.path for e in selected], self.remote_path,
+                progress=progress)
+            self.app.run_worker(self._run_sync(cmd, len(selected), progress))
 
-    def _delete_local(self, e) -> None:
-        try:
-            if e.is_dir and not e.is_symlink:
-                shutil.rmtree(e.path)
+        # The status box is max-height: 14, so keep only this many itemize
+        # lines for display (older ones are counted, not rendered); live
+        # progress re-renders are throttled to ~4 Hz.
+        _MAX_STATUS_ITEMS = 30
+        _RENDER_INTERVAL = 0.25
+
+        async def _run_sync(self, cmd: list, total: int, progress: bool) -> None:
+            done = 0
+            items: list = []  # last _MAX_STATUS_ITEMS itemize lines (display)
+            counts = {"f": 0, "d": 0, "=": 0}  # totals over the whole transfer
+            n_items = 0
+            self._xfer_bytes = 0
+            self._speed = 0.0
+            self._pct = 0
+            self._avg_speed = 0.0
+            t0 = time.monotonic()
+            last_render = 0.0
+
+            def feed(segment: str) -> None:
+                """Consume one \n-delimited segment of rsync stdout. With
+                --info=progress2 a segment may hold an itemize line, a progress
+                sample, or both (progress updates are \r-separated and can glue
+                onto the next line), so each \r-part is tried against both."""
+                nonlocal done, n_items, last_render
+                for part in segment.split("\r"):
+                    it = parse_itemize(part)
+                    if it:
+                        n_items += 1
+                        counts[it[0]] += 1
+                        items.append(it)
+                        if len(items) > self._MAX_STATUS_ITEMS:
+                            items.pop(0)
+                        if not progress:  # without progress2, -i lines arrive on
+                            done += 1     # completion; with it, they arrive on
+                                          # start, so xfr# below counts instead
+                    if progress:
+                        pg = parse_progress(part)
+                        if pg:
+                            b, pct, speed, xfr = pg
+                            self._xfer_bytes = b
+                            self._pct = pct
+                            self._speed = speed
+                            if xfr is not None:
+                                done = xfr
+                            # progress samples arrive continuously; re-rendering
+                            # the status box on every one is O(n^2) over a big
+                            # transfer, so throttle to ~4 Hz
+                            now = time.monotonic()
+                            if now - last_render >= self._RENDER_INTERVAL:
+                                last_render = now
+                                self._render_sync_status(items, done, total,
+                                                         "transferring…", None,
+                                                         counts, n_items)
+
+            try:
+                # LC_ALL=C: stable number format in progress samples (some
+                # locales use ',' decimals / lakh grouping)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, "LC_ALL": "C"},
+                )
+                self._transfer_proc = proc
+                err_task = asyncio.create_task(proc.stderr.read())
+                buf = ""
+                while True:
+                    chunk = await proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk.decode(errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        feed(line)
+                    if buf:  # in-progress tail (live \r updates)
+                        feed(buf)
+                        buf = ""
+                await proc.wait()
+                err = await err_task
+            except FileNotFoundError:
+                # no rsync locally: report it, and let the finally below clear
+                # self.busy or the screen would swallow every key but escape
+                self._render_sync_status([], 0, 0, None,
+                                         "rsync is not installed locally")
+                self.app.notify("rsync is not installed locally — install it "
+                                "to use file sync", title="sync",
+                                severity="error")
+                return
+            finally:
+                self._transfer_proc = None
+                self.busy = False
+            if not self.is_mounted:
+                return  # screen closed (e.g. transfer killed + quit)
+            elapsed = time.monotonic() - t0
+            if elapsed > 0 and self._xfer_bytes:
+                self._avg_speed = self._xfer_bytes / elapsed
+            if proc.returncode != 0 and not items:
+                self._render_sync_status([], 0, 0, None,
+                                         "rsync failed on the remote host")
+                self.app.notify("transfer failed — is rsync installed on the "
+                                f"remote host ({self.host.display})?",
+                                title="sync", severity="error")
+                return
+            self._render_sync_status(items, done, total, "done", None,
+                                     counts, n_items)
+            # refresh the remote panel so what just arrived is visible
+            self.app.run_worker(self._load_remote())
+            local = self.query_one("#local-list", FileList)
+            for e in local.entries:
+                e.selected = False
+            local.refresh()
+
+        def _render_sync_status(self, items, done, total, state, error,
+                                counts=None, n_items=None) -> None:
+            self._set_progress(done, total, state)
+            status = self.query_one("#sync-status", Static)
+            t = Text(end="")
+            if error:
+                t.append("  transfer failed:\n", style="bold red")
+                for line in error.strip().splitlines()[:10]:
+                    t.append(f"  {line}\n", style="red")
+                status.update(t)
+                return
+            if counts is None:  # called without item data (error/idle paths)
+                counts = {"f": 0, "d": 0, "=": 0}
+                for ty, _name in items:
+                    counts[ty] = counts.get(ty, 0) + 1
+            files, dirs, syms = counts["f"], counts["d"], counts["="]
+            hidden = (n_items - len(items)) if n_items is not None else 0
+            if state == "done":
+                t.append(f" ✓ done  {files} file(s), {dirs} dir(s)",
+                         style="bold green")
+                if syms:
+                    t.append(f", {syms} symlink(s)", style="bold cyan")
+                if self._avg_speed > 0:
+                    t.append(f"  ·  avg {fmt_speed(self._avg_speed)}",
+                             style="dim")
             else:
-                os.remove(e.path)
-        except OSError as ex:
-            self._update_status(f"✗ could not delete {e.name}: {ex}")
-            return
-        local = self.query_one("#local-list", FileList)
-        local.entries = list_local_dir(Path(self.local_path))
-        local.cursor, local.scroll = 0, 0
-        local.refresh()
-        self._refresh_bars()
-        self._update_status(f"deleted {e.name}")
-
-    async def _delete_remote(self, e) -> None:
-        full = self.remote_path.rstrip("/") + "/" + e.name
-        # Safety: the target must never be empty or the whole filesystem/home.
-        # Reject the root ("/", "//") and the home root ("~", "~/") before we
-        # ever build or send the command, so a missing/empty name can never
-        # become `rm -rf -- /`.
-        root = full.rstrip("/")
-        if not root or root == "~":
-            self._update_status(f"✗ cannot delete {e.name}")
-            return
-        # The ssh client joins the remote words with plain spaces before the
-        # remote login shell parses them, so the path must be quoted *inside
-        # the command string* (single quotes: fully literal, also defeats
-        # globs and injection). A leading ~ is sent as $HOME so the remote
-        # shell expands it.
-        if full.startswith("~"):
-            remote_cmd = f'rm -rf -- "$HOME"{_sh_quote(full[1:])}'
-        else:
-            remote_cmd = f"rm -rf -- {_sh_quote(full)}"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *_rsync_ssh_shell(self.host).split(), self.host.target,
-                remote_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, err = await proc.communicate()
-        except FileNotFoundError:
-            self._update_status("✗ ssh is not installed locally")
-            return
-        if proc.returncode != 0:
-            detail = (err.decode(errors="replace").strip()
-                      or f"exited {proc.returncode}")
-            self._update_status(f"✗ could not delete {e.name}: {detail}")
-            return
-        self.app.run_worker(self._load_remote())
-        self._update_status(f"deleted {e.name} from remote")
-
-    # -- keys
-
-    def on_key(self, event: events.Key) -> None:
-        key = event.key
-        if self.busy:
-            if key in ("escape", "q", "ctrl+q") and not self._confirm_open:
-                self._confirm_open = True
-                event.stop()
-                # don't kill a running transfer on the first esc: ask
-                self.app.run_worker(self._confirm_quit())
-            event.stop()
-            return
-        if key in ("escape", "q", "ctrl+q"):
-            self.app.pop_screen()
-            event.stop()
-            return
-        if key in ("tab", "f7"):
-            self._switch_panel()
-            event.stop()
-        elif key in ("f5", "c"):
-            self.do_copy()
-            event.stop()
-        elif key == "f8":
-            self.app.run_worker(self._delete_selected())
-            event.stop()
-        elif key == "up":
-            lst = self._active_list()
-            lst.cursor = max(0, lst.cursor - 1)
-            lst.refresh()
-            event.stop()
-        elif key == "down":
-            lst = self._active_list()
-            lst.cursor = min(len(lst.filtered) - 1, lst.cursor + 1)
-            lst.refresh()
-            event.stop()
-        elif key == "pageup":
-            lst = self._active_list()
-            lst.cursor = max(0, lst.cursor - max(1, lst.size.height - 2))
-            lst.refresh()
-            event.stop()
-        elif key == "pagedown":
-            lst = self._active_list()
-            lst.cursor = min(max(0, len(lst.filtered) - 1),
-                             lst.cursor + max(1, lst.size.height - 2))
-            lst.refresh()
-            event.stop()
-        elif key == "home":
-            self._active_list().cursor = 0
-            self._active_list().refresh()
-            event.stop()
-        elif key == "end":
-            lst = self._active_list()
-            lst.cursor = max(0, len(lst.filtered) - 1)
-            lst.refresh()
-            event.stop()
-        elif key in ("enter", "right"):
-            self._open_dir()
-            event.stop()
-        elif key in ("backspace", "left"):
-            self._go_up()
-            event.stop()
-        elif key == "space":
-            self._toggle_select()
-            event.stop()
-        elif key == "*":
-            self._select_all(True)
-            event.stop()
-        elif key == "/":
-            self._select_all(False)
-            event.stop()
-        elif key == "h":
-            self._toggle_hidden()
-            event.stop()
-        elif key in ("question_mark", "f1"):
-            self.app.push_screen(HelpScreen(sync_help_text()))
-            event.stop()
-        elif event.is_printable:
-            self._active_list().filter += event.character
-            self._active_list().refresh()
-            event.stop()
-
-
-class OptionsPanel(Widget):
-    """The ^o panel: one row per ssh option. ↑↓ selects, ←/→/⏎ cycles the
-    selected option's value (off → v1 → … → off). Keys are handled by the
-    app (see SSHWiz.options_key)."""
-    can_focus = True
-    DEFAULT_CSS = """
-    OptionsPanel {
-        width: 100%;
-        height: auto;
-        max-height: 12;
-        background: $surface;
-        display: none;
-        padding: 0 1;
-        border-bottom: heavy $border;
-    }
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.cursor = 0
-
-    def render(self):
-        app = self.app
-        t = Text()
-        t.append(" ssh options", style="bold")
-        t.append("      ←→/⏎: value    esc: close", style="dim")
-        for i, (label, _values) in enumerate(app.options):
-            cur = app.option_state.get(label, "")
-            row = Text()
-            prefix = "→ " if i == self.cursor else "  "
-            style = "bold reverse" if i == self.cursor else ""
-            row.append(f"{prefix}{label:<10}", style=style)
-            if cur:
-                row.append(f" {cur}", style="bold")
-            else:
-                row.append(" off", style="dim")
+                t.append(f" ⏳ {state} {done}/{total}…", style="bold cyan")
+                if self._speed > 0:
+                    t.append(f"  ·  {fmt_speed(self._speed)}", style="dim")
+                if self._pct:
+                    t.append(f"  ·  {self._pct}%", style="dim")
             t.append("\n")
-            t.append_text(row)
-        return t
+            if hidden:
+                t.append(f"  … {hidden} earlier item(s) not shown\n", style="dim")
+            for ty, name in items:
+                if ty == "f":
+                    t.append(f"  → {name}\n", style="green")
+                elif ty == "d":
+                    t.append(f"  ↗ {name}/\n", style="dim")
+                else:
+                    t.append(f"  ↷ {name}\n", style="cyan")
+            status.update(t)
 
+        def _update_status(self, text: str) -> None:
+            self.query_one("#sync-status", Static).update(Text(text))
 
-class CmdLine(Widget):
-    """The final ssh command for the selected host, drawn below the
-    category tabs (options panel when open), with a dim separator line
-    underneath; the line above the command is the tabs/options border.
-    Shows exactly what enter / ^y will run; long commands wrap to a
-    second line instead of being clipped."""
-    DEFAULT_CSS = """
-    CmdLine {
-        width: 100%;
-        height: auto;
-        min-height: 2;
-        background: $surface;
-    }
-    """
+        def _set_progress(self, done: int, total: int, state: str) -> None:
+            """Show and update the transfer progress bar.
 
-    def render(self) -> Text:
-        app = self.app
-        hl = app.query_one(HostList)
-        t = Text(end="")
-        if hl.shown:
-            host = hl.shown[hl.cursor]
-            cmd = " ".join(
-                build_ssh_cmd(host, app.enabled_options(), app.tmux_mode))
-            t.append(cmd)
-        else:
-            t.append("(no host selected)", style="dim")
-        t.append("\n")
-        t.append("─" * max(1, self.size.width), style="dim")
-        return t
-
-    def on_resize(self, event) -> None:
-        self.refresh()
-
-
-class SSHWiz(App):
-    TITLE = "ssh-wiz"
-
-    CSS = """
-    #status {
-        height: 1;
-        background: $primary-background;
-        color: $text;
-        padding: 0 1;
-    }
-    #tabs {
-        height: 2;
-        background: $surface;
-        color: $text;
-        padding: 0 1;
-        border-bottom: heavy $border;
-    }
-    #hints {
-        height: 1;
-        background: $surface;
-        color: $text-muted;
-        padding: 0 1;
-    }
-    """
-
-    ENABLE_COMMAND_PALETTE = False
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.options = load_options()
-        saved = load_option_state()
-        self.option_state = {}
-        for label, values in self.options:  # stale values dropped
-            v = saved.get(label, "")
-            self.option_state[label] = v if v in values else ""
-        self.options_open = False
-        self.tmux_mode = False
-        self.connecting = False
-        self.categories = [ALL_CATEGORY]
-        self.cat_colors = {}
-        self.current_cat = ALL_CATEGORY
-
-    def compose(self) -> ComposeResult:
-        yield Static("", id="status")
-        yield Static("", id="tabs")
-        yield OptionsPanel()
-        yield CmdLine()
-        yield HostList()
-        yield Static(hints_text(), id="hints")
-
-    # -- data
-
-    def reload(self) -> None:
-        rules = load_category_rules(CATEGORIES_FILE)
-        hosts, favs = rank_hosts(build_hosts(rules))
-        self.categories = category_order(hosts, rules)
-        self.cat_colors = category_colors(hosts, rules)
-        if self.current_cat not in self.categories:
-            self.current_cat = ALL_CATEGORY
-        hl = self.query_one(HostList)
-        hl.hosts = hosts
-        hl.favs = favs
-        hl.apply_filter()
-        self.update_tabs()
-        self.update_status()
-
-    def update_tabs(self) -> None:
-        hl = self.query_one(HostList)
-        counts: dict = {}
-        for h in hl.hosts:
-            counts[h.category] = counts.get(h.category, 0) + 1
-        t = Text()
-        for cat in self.categories:
-            n = len(hl.hosts) if cat == ALL_CATEGORY else counts.get(cat, 0)
-            color = self.cat_colors.get(cat, "")
-            label = f" {cat} ({n}) "
-            if cat == self.current_cat:
-                t.append(label, style=f"{color} bold reverse")
+            The bar is hidden unless a transfer is in progress (``state`` is
+            ``"transferring…"``) or just finished (``"done"``); otherwise (error or
+            idle) it is hidden so it does not sit empty at the bottom of the screen.
+            """
+            bar = self.query_one("#sync-progress", ProgressBar)
+            if state in ("transferring…", "done"):
+                bar.display = True
+                bar.update(total=total, progress=min(done, total))
             else:
-                t.append(label, style=color)
-        self.query_one("#tabs", Static).update(t)
+                bar.display = False
 
-    def switch_cat(self, delta: int) -> None:
-        if len(self.categories) < 2:
-            return
-        i = self.categories.index(self.current_cat)
-        self.current_cat = self.categories[(i + delta) % len(self.categories)]
-        hl = self.query_one(HostList)
-        hl.apply_filter()
-        self.update_tabs()
-        self.update_status()
+        def _refresh_help(self) -> None:
+            """Render the shortcut legend shown at the bottom of the screen."""
+            bar = self.query_one("#sync-help", Static)
+            t = Text(end="")
+            for row in (
+                [("space", "select"), ("*", "all"), ("/", "none"),
+                 ("h", "hidden"), ("↵", "open"), ("←", "up")],
+                [("F5/c", "copy"), ("F8", "delete"),
+                 ("?/F1", "help"), ("esc", "close")],
+            ):
+                for key, action in row:
+                    t.append(f"  {key:<6}", style="bold yellow")
+                    t.append(f"{action}  ", style="dim")
+                t.append("\n")
+            t.rstrip()
+            bar.update(t)
 
-    def update_status(self) -> None:
-        hl = self.query_one(HostList)
-        parts = []
-        if DEMO:
-            parts.append("[bold magenta]DEMO MODE[/] (sample data — "
-                         "no real connections)")
-        if self.option_state and any(self.option_state.values()):
-            enabled = [l for l, _v in self.options
-                       if self.option_state.get(l)]
-            parts.append("opts: " +
-                         " ".join(f"[bold]{escape(l)}[/]" for l in enabled))
-        if self.tmux_mode:
-            parts.append("[bold green]TMUX[/] (tmux new -A -s wiz-<host>)")
-        if hl.filter:
-            parts.append(f"filter: [bold]{escape(hl.filter)}[/]")
-        parts.append(f"{len(hl.shown)}/{len(hl.hosts)} hosts")
-        self.query_one("#status", Static).update("   ".join(parts))
-        self.update_cmd()
+        # -- delete (F8)
 
-    def update_cmd(self) -> None:
-        # layout=True: a wrapped command changes the widget's auto height
-        self.query_one(CmdLine).refresh(layout=True)
+        async def _delete_selected(self) -> None:
+            """F8: ask for confirmation, then delete the entry under the cursor.
+            A directory's contents go with it, so the prompt says so."""
+            lst = self._active_list()
+            e = lst.entry_at_cursor()
+            if e is None:
+                return
+            if e.name:
+                if e.is_dir and not e.is_symlink:
+                    msg = f"Delete {e.name}/ and all its contents?"
+                else:
+                    msg = f"Delete {e.name}?"
+                answer = await self.app.push_screen(
+                    ConfirmScreen(msg), wait_for_dismiss=True)
+                if not answer:
+                    return
+            if self.active == "local":
+                self._delete_local(e)
+            else:
+                self.app.run_worker(self._delete_remote(e))
 
-    def on_mount(self) -> None:
-        if DEMO:
-            self.title = "ssh-wiz (demo)"
-        self.reload()
-        self.query_one(HostList).focus()
+        def _delete_local(self, e) -> None:
+            try:
+                if e.is_dir and not e.is_symlink:
+                    shutil.rmtree(e.path)
+                else:
+                    os.remove(e.path)
+            except OSError as ex:
+                self._update_status(f"✗ could not delete {e.name}: {ex}")
+                return
+            local = self.query_one("#local-list", FileList)
+            local.entries = list_local_dir(Path(self.local_path))
+            local.cursor, local.scroll = 0, 0
+            local.refresh()
+            self._refresh_bars()
+            self._update_status(f"deleted {e.name}")
 
-    # -- actions
+        async def _delete_remote(self, e) -> None:
+            full = self.remote_path.rstrip("/") + "/" + e.name
+            # Safety: the target must never be empty or the whole filesystem/home.
+            # Reject the root ("/", "//") and the home root ("~", "~/") before we
+            # ever build or send the command, so a missing/empty name can never
+            # become `rm -rf -- /`.
+            root = full.rstrip("/")
+            if not root or root == "~":
+                self._update_status(f"✗ cannot delete {e.name}")
+                return
+            # The ssh client joins the remote words with plain spaces before the
+            # remote login shell parses them, so the path must be quoted *inside
+            # the command string* (single quotes: fully literal, also defeats
+            # globs and injection). A leading ~ is sent as $HOME so the remote
+            # shell expands it.
+            if full.startswith("~"):
+                remote_cmd = f'rm -rf -- "$HOME"{_sh_quote(full[1:])}'
+            else:
+                remote_cmd = f"rm -rf -- {_sh_quote(full)}"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *_rsync_ssh_shell(self.host).split(), self.host.target,
+                    remote_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, err = await proc.communicate()
+            except FileNotFoundError:
+                self._update_status("✗ ssh is not installed locally")
+                return
+            if proc.returncode != 0:
+                detail = (err.decode(errors="replace").strip()
+                          or f"exited {proc.returncode}")
+                self._update_status(f"✗ could not delete {e.name}: {detail}")
+                return
+            self.app.run_worker(self._load_remote())
+            self._update_status(f"deleted {e.name} from remote")
 
-    def toggle_favorite(self) -> None:
-        hl = self.query_one(HostList)
-        if not hl.shown:
-            return
-        host = hl.shown[hl.cursor]
-        is_fav = toggle_favorite_file(host.name)
-        self.reload()
-        for i, h in enumerate(hl.shown):
-            if h.name == host.name:
-                hl.cursor = i
-                break
-        hl.refresh()
-        verb = "★ added to favorites" if is_fav else "removed from favorites"
-        self.notify(f"{verb}: {host.name}", title="ssh-wiz")
+        # -- keys
 
-    def connect_to(self, host: Host) -> None:
-        if self.connecting:
-            return
-        if DEMO:
-            cmd = " ".join(
-                build_ssh_cmd(host, self.enabled_options(), self.tmux_mode))
-            self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
-            record_use(host.name)  # demo state only: usage.json grows on connect
+        def on_key(self, event: events.Key) -> None:
+            key = event.key
+            if self.busy:
+                if key in ("escape", "q", "ctrl+q") and not self._confirm_open:
+                    self._confirm_open = True
+                    event.stop()
+                    # don't kill a running transfer on the first esc: ask
+                    self.app.run_worker(self._confirm_quit())
+                event.stop()
+                return
+            if key in ("escape", "q", "ctrl+q"):
+                self.app.pop_screen()
+                event.stop()
+                return
+            if key in ("tab", "f7"):
+                self._switch_panel()
+                event.stop()
+            elif key in ("f5", "c"):
+                self.do_copy()
+                event.stop()
+            elif key == "f8":
+                self.app.run_worker(self._delete_selected())
+                event.stop()
+            elif key == "up":
+                lst = self._active_list()
+                lst.cursor = max(0, lst.cursor - 1)
+                lst.refresh()
+                event.stop()
+            elif key == "down":
+                lst = self._active_list()
+                lst.cursor = min(len(lst.filtered) - 1, lst.cursor + 1)
+                lst.refresh()
+                event.stop()
+            elif key == "pageup":
+                lst = self._active_list()
+                lst.cursor = max(0, lst.cursor - max(1, lst.size.height - 2))
+                lst.refresh()
+                event.stop()
+            elif key == "pagedown":
+                lst = self._active_list()
+                lst.cursor = min(max(0, len(lst.filtered) - 1),
+                                 lst.cursor + max(1, lst.size.height - 2))
+                lst.refresh()
+                event.stop()
+            elif key == "home":
+                self._active_list().cursor = 0
+                self._active_list().refresh()
+                event.stop()
+            elif key == "end":
+                lst = self._active_list()
+                lst.cursor = max(0, len(lst.filtered) - 1)
+                lst.refresh()
+                event.stop()
+            elif key in ("enter", "right"):
+                self._open_dir()
+                event.stop()
+            elif key in ("backspace", "left"):
+                self._go_up()
+                event.stop()
+            elif key == "space":
+                self._toggle_select()
+                event.stop()
+            elif key == "*":
+                self._select_all(True)
+                event.stop()
+            elif key == "/":
+                self._select_all(False)
+                event.stop()
+            elif key == "h":
+                self._toggle_hidden()
+                event.stop()
+            elif key in ("question_mark", "f1"):
+                self.app.push_screen(HelpScreen(sync_help_text()))
+                event.stop()
+            elif event.is_printable:
+                self._active_list().filter += event.character
+                self._active_list().refresh()
+                event.stop()
+
+
+    class OptionsPanel(Widget):
+        """The ^o panel: one row per ssh option. ↑↓ selects, ←/→/⏎ cycles the
+        selected option's value (off → v1 → … → off). Keys are handled by the
+        app (see SSHWiz.options_key)."""
+        can_focus = True
+        DEFAULT_CSS = """
+        OptionsPanel {
+            width: 100%;
+            height: auto;
+            max-height: 12;
+            background: $surface;
+            display: none;
+            padding: 0 1;
+            border-bottom: heavy $border;
+        }
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.cursor = 0
+
+        def render(self):
+            app = self.app
+            t = Text()
+            t.append(" ssh options", style="bold")
+            t.append("      ←→/⏎: value    esc: close", style="dim")
+            for i, (label, _values) in enumerate(app.options):
+                cur = app.option_state.get(label, "")
+                row = Text()
+                prefix = "→ " if i == self.cursor else "  "
+                style = "bold reverse" if i == self.cursor else ""
+                row.append(f"{prefix}{label:<10}", style=style)
+                if cur:
+                    row.append(f" {cur}", style="bold")
+                else:
+                    row.append(" off", style="dim")
+                t.append("\n")
+                t.append_text(row)
+            return t
+
+
+    class CmdLine(Widget):
+        """The final ssh command for the selected host, drawn below the
+        category tabs (options panel when open), with a dim separator line
+        underneath; the line above the command is the tabs/options border.
+        Shows exactly what enter / ^y will run; long commands wrap to a
+        second line instead of being clipped."""
+        DEFAULT_CSS = """
+        CmdLine {
+            width: 100%;
+            height: auto;
+            min-height: 2;
+            background: $surface;
+        }
+        """
+
+        def render(self) -> Text:
+            app = self.app
+            hl = app.query_one(HostList)
+            t = Text(end="")
+            if hl.shown:
+                host = hl.shown[hl.cursor]
+                cmd = " ".join(
+                    build_ssh_cmd(host, app.enabled_options(), app.tmux_mode))
+                t.append(cmd)
+            else:
+                t.append("(no host selected)", style="dim")
+            t.append("\n")
+            t.append("─" * max(1, self.size.width), style="dim")
+            return t
+
+        def on_resize(self, event) -> None:
+            self.refresh()
+
+
+    class SSHWiz(App):
+        TITLE = "ssh-wiz"
+
+        CSS = """
+        #status {
+            height: 1;
+            background: $primary-background;
+            color: $text;
+            padding: 0 1;
+        }
+        #tabs {
+            height: 2;
+            background: $surface;
+            color: $text;
+            padding: 0 1;
+            border-bottom: heavy $border;
+        }
+        #hints {
+            height: 1;
+            background: $surface;
+            color: $text-muted;
+            padding: 0 1;
+        }
+        """
+
+        ENABLE_COMMAND_PALETTE = False
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.options = load_options()
+            saved = load_option_state()
+            self.option_state = {}
+            for label, values in self.options:  # stale values dropped
+                v = saved.get(label, "")
+                self.option_state[label] = v if v in values else ""
+            self.options_open = False
+            self.tmux_mode = False
+            self.connecting = False
+            self.categories = [ALL_CATEGORY]
+            self.cat_colors = {}
+            self.current_cat = ALL_CATEGORY
+
+        def compose(self) -> ComposeResult:
+            yield Static("", id="status")
+            yield Static("", id="tabs")
+            yield OptionsPanel()
+            yield CmdLine()
+            yield HostList()
+            yield Static(hints_text(), id="hints")
+
+        # -- data
+
+        def reload(self) -> None:
+            rules = load_category_rules(CATEGORIES_FILE)
+            hosts, favs = rank_hosts(build_hosts(rules))
+            self.categories = category_order(hosts, rules)
+            self.cat_colors = category_colors(hosts, rules)
+            if self.current_cat not in self.categories:
+                self.current_cat = ALL_CATEGORY
+            hl = self.query_one(HostList)
+            hl.hosts = hosts
+            hl.favs = favs
+            hl.apply_filter()
+            self.update_tabs()
+            self.update_status()
+
+        def update_tabs(self) -> None:
+            hl = self.query_one(HostList)
+            counts: dict = {}
+            for h in hl.hosts:
+                counts[h.category] = counts.get(h.category, 0) + 1
+            t = Text()
+            for cat in self.categories:
+                n = len(hl.hosts) if cat == ALL_CATEGORY else counts.get(cat, 0)
+                color = self.cat_colors.get(cat, "")
+                label = f" {cat} ({n}) "
+                if cat == self.current_cat:
+                    t.append(label, style=f"{color} bold reverse")
+                else:
+                    t.append(label, style=color)
+            self.query_one("#tabs", Static).update(t)
+
+        def switch_cat(self, delta: int) -> None:
+            if len(self.categories) < 2:
+                return
+            i = self.categories.index(self.current_cat)
+            self.current_cat = self.categories[(i + delta) % len(self.categories)]
+            hl = self.query_one(HostList)
+            hl.apply_filter()
+            self.update_tabs()
+            self.update_status()
+
+        def update_status(self) -> None:
+            hl = self.query_one(HostList)
+            parts = []
+            if DEMO:
+                parts.append("[bold magenta]DEMO MODE[/] (sample data — "
+                             "no real connections)")
+            if self.option_state and any(self.option_state.values()):
+                enabled = [l for l, _v in self.options
+                           if self.option_state.get(l)]
+                parts.append("opts: " +
+                             " ".join(f"[bold]{escape(l)}[/]" for l in enabled))
+            if self.tmux_mode:
+                parts.append("[bold green]TMUX[/] (tmux new -A -s wiz-<host>)")
+            if hl.filter:
+                parts.append(f"filter: [bold]{escape(hl.filter)}[/]")
+            parts.append(f"{len(hl.shown)}/{len(hl.hosts)} hosts")
+            self.query_one("#status", Static).update("   ".join(parts))
+            self.update_cmd()
+
+        def update_cmd(self) -> None:
+            # layout=True: a wrapped command changes the widget's auto height
+            self.query_one(CmdLine).refresh(layout=True)
+
+        def on_mount(self) -> None:
+            if DEMO:
+                self.title = "ssh-wiz (demo)"
+            self.reload()
+            self.query_one(HostList).focus()
+
+        # -- actions
+
+        def toggle_favorite(self) -> None:
+            hl = self.query_one(HostList)
+            if not hl.shown:
+                return
+            host = hl.shown[hl.cursor]
+            is_fav = toggle_favorite_file(host.name)
+            self.reload()
+            for i, h in enumerate(hl.shown):
+                if h.name == host.name:
+                    hl.cursor = i
+                    break
+            hl.refresh()
+            verb = "★ added to favorites" if is_fav else "removed from favorites"
+            self.notify(f"{verb}: {host.name}", title="ssh-wiz")
+
+        def connect_to(self, host: Host) -> None:
+            if self.connecting:
+                return
+            if DEMO:
+                cmd = " ".join(
+                    build_ssh_cmd(host, self.enabled_options(), self.tmux_mode))
+                self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
+                record_use(host.name)  # demo state only: usage.json grows on connect
+                self.reload()
+                hl = self.query_one(HostList)
+                for i, h in enumerate(hl.shown):
+                    if h.name == host.name:
+                        hl.cursor = i
+                        break
+                hl.refresh()
+                return
+            cmd = build_ssh_cmd(host, self.enabled_options(), self.tmux_mode)
+            self.connecting = True
+            self.query_one("#status", Static).update(
+                f"[bold cyan]⏳ ssh {escape(host.display)} — terminal handed over…[/]")
+            record_use(host.name)
+            try:
+                with self.suspend():
+                    rc = subprocess.run(cmd, check=False).returncode
+            except SuspendNotSupported:
+                self.notify("terminal does not support suspend — run: " + " ".join(cmd),
+                            severity="error")
+                self.update_status()
+                return
+            finally:
+                self.connecting = False
             self.reload()
             hl = self.query_one(HostList)
             for i, h in enumerate(hl.shown):
@@ -2073,267 +2111,249 @@ class SSHWiz(App):
                     hl.cursor = i
                     break
             hl.refresh()
-            return
-        cmd = build_ssh_cmd(host, self.enabled_options(), self.tmux_mode)
-        self.connecting = True
-        self.query_one("#status", Static).update(
-            f"[bold cyan]⏳ ssh {escape(host.display)} — terminal handed over…[/]")
-        record_use(host.name)
-        try:
-            with self.suspend():
-                rc = subprocess.run(cmd, check=False).returncode
-        except SuspendNotSupported:
-            self.notify("terminal does not support suspend — run: " + " ".join(cmd),
-                        severity="error")
+            self.notify(f"ssh exit {rc}: {host.name}",
+                        severity="information" if rc == 0 else "warning")
+
+        def do_connect(self) -> None:
+            hl = self.query_one(HostList)
+            if not hl.shown:
+                return
+            self.connect_to(hl.shown[hl.cursor])
+
+        def open_file_sync(self) -> None:
+            """Open the twin-panel file-sync screen (Ctrl+S) for the selected
+            host: local filesystem on the left, the host's filesystem on the
+            right. Local -> remote only (key auth, no password)."""
+            hl = self.query_one(HostList)
+            if not hl.shown:
+                self.app.notify("no hosts shown — select one first", title="sync", severity="warning")
+                return
+            self.push_screen(FileSyncScreen(hl.shown[hl.cursor]))
+
+        # -- options panel (^o)
+
+        def enabled_options(self) -> list:
+            """Enabled 'option=value' strings, in panel order."""
+            return [self.option_state[label]
+                    for label, _values in self.options
+                    if self.option_state.get(label)]
+
+        def toggle_help(self) -> None:
+            if isinstance(self.screen, HelpScreen):
+                self.pop_screen()
+            else:
+                self.push_screen(HelpScreen())
+
+        def toggle_options_panel(self) -> None:
+            panel = self.query_one(OptionsPanel)
+            if self.options_open:
+                self.close_options_panel()
+            else:
+                if not self.options:
+                    self.notify(f"no ssh options defined ({OPTIONS_FILE})",
+                                severity="warning")
+                    return
+                panel.cursor = 0
+                panel.styles.display = "block"  # DEFAULT_CSS hides it
+                self.options_open = True
+                panel.focus()
+                self.query_one("#hints", Static).update(OPTIONS_HINTS)
+                self.update_status()
+
+        def close_options_panel(self) -> None:
+            self.query_one(OptionsPanel).styles.display = "none"
+            self.options_open = False
+            self.query_one("#hints", Static).update(hints_text())
+            self.query_one(HostList).focus()
             self.update_status()
-            return
-        finally:
-            self.connecting = False
-        self.reload()
-        hl = self.query_one(HostList)
-        for i, h in enumerate(hl.shown):
-            if h.name == host.name:
-                hl.cursor = i
-                break
-        hl.refresh()
-        self.notify(f"ssh exit {rc}: {host.name}",
-                    severity="information" if rc == 0 else "warning")
 
-    def do_connect(self) -> None:
-        hl = self.query_one(HostList)
-        if not hl.shown:
-            return
-        self.connect_to(hl.shown[hl.cursor])
+        def options_key(self, key: str) -> None:
+            panel = self.query_one(OptionsPanel)
+            if key in ("escape", "ctrl+o"):
+                self.close_options_panel()
+            elif key == "up":
+                panel.cursor = max(0, panel.cursor - 1)
+                panel.refresh()
+            elif key == "down":
+                panel.cursor = min(len(self.options) - 1, panel.cursor + 1)
+                panel.refresh()
+            elif key in ("left", "right", "enter"):
+                self.cycle_option(-1 if key == "left" else 1)
 
-    def open_file_sync(self) -> None:
-        """Open the twin-panel file-sync screen (Ctrl+S) for the selected
-        host: local filesystem on the left, the host's filesystem on the
-        right. Local -> remote only (key auth, no password)."""
-        hl = self.query_one(HostList)
-        if not hl.shown:
-            self.app.notify("no hosts shown — select one first", title="sync", severity="warning")
-            return
-        self.push_screen(FileSyncScreen(hl.shown[hl.cursor]))
+        def cycle_option(self, delta: int) -> None:
+            panel = self.query_one(OptionsPanel)
+            label, values = self.options[panel.cursor]
+            n = len(values) + 1  # off + all values
+            cur = self.option_state.get(label, "")
+            i = (values.index(cur) if cur in values else -1) + delta
+            i %= n
+            self.option_state[label] = "" if i == n - 1 else values[i]
+            save_option_state(self.option_state)
+            panel.refresh()
+            self.update_status()
 
-    # -- options panel (^o)
-
-    def enabled_options(self) -> list:
-        """Enabled 'option=value' strings, in panel order."""
-        return [self.option_state[label]
-                for label, _values in self.options
-                if self.option_state.get(label)]
-
-    def toggle_help(self) -> None:
-        if isinstance(self.screen, HelpScreen):
-            self.pop_screen()
-        else:
-            self.push_screen(HelpScreen())
-
-    def toggle_options_panel(self) -> None:
-        panel = self.query_one(OptionsPanel)
-        if self.options_open:
-            self.close_options_panel()
-        else:
-            if not self.options:
-                self.notify(f"no ssh options defined ({OPTIONS_FILE})",
+        def edit_config(self) -> None:
+            if DEMO:
+                self.notify("demo mode — no real config to edit",
                             severity="warning")
                 return
-            panel.cursor = 0
-            panel.styles.display = "block"  # DEFAULT_CSS hides it
-            self.options_open = True
-            panel.focus()
-            self.query_one("#hints", Static).update(OPTIONS_HINTS)
-            self.update_status()
+            hl = self.query_one(HostList)
+            if not hl.shown:
+                return
+            host = hl.shown[hl.cursor]
+            line = find_config_line(host.host or host.name)
+            if line is None:
+                line = 1
+                self.notify(f"{host.name} not in ~/.ssh/config — opening top",
+                            severity="warning")
+            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+            parts = shlex.split(editor)
+            editor_bin = Path(parts[0]).name
+            if editor_bin == "code":
+                args = parts + ["-g", f"{SSH_CONFIG}:{line}"]
+            elif editor_bin in ("vi", "vim", "nvim", "emacs", "micro"):
+                args = parts + [f"+{line}", str(SSH_CONFIG)]
+            else:
+                args = parts + [str(SSH_CONFIG)]
+                self.notify(f"{editor_bin} can't jump to a line — "
+                            f"opened ~/.ssh/config at top", severity="warning")
+            try:
+                with self.suspend():
+                    subprocess.run(args, check=False)
+            except SuspendNotSupported:
+                self.notify("terminal does not support suspend", severity="error")
+                return
+            self.reload()
 
-    def close_options_panel(self) -> None:
-        self.query_one(OptionsPanel).styles.display = "none"
-        self.options_open = False
-        self.query_one("#hints", Static).update(hints_text())
-        self.query_one(HostList).focus()
-        self.update_status()
+        def edit_categories(self) -> None:
+            """Open the categories file in $EDITOR, then reload (tabs, colors
+            and categorization rebuild). In demo mode the demo's temp file is
+            edited — safe, and a nice live demo of re-categorization."""
+            path = CATEGORIES_FILE
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(CATEGORIES_TEMPLATE)
+            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+            args = shlex.split(editor) + [str(path)]
+            try:
+                with self.suspend():
+                    subprocess.run(args, check=False)
+            except SuspendNotSupported:
+                self.notify("terminal does not support suspend", severity="error")
+                return
+            self.reload()
 
-    def options_key(self, key: str) -> None:
-        panel = self.query_one(OptionsPanel)
-        if key in ("escape", "ctrl+o"):
-            self.close_options_panel()
-        elif key == "up":
-            panel.cursor = max(0, panel.cursor - 1)
-            panel.refresh()
-        elif key == "down":
-            panel.cursor = min(len(self.options) - 1, panel.cursor + 1)
-            panel.refresh()
-        elif key in ("left", "right", "enter"):
-            self.cycle_option(-1 if key == "left" else 1)
+        # -- keys
 
-    def cycle_option(self, delta: int) -> None:
-        panel = self.query_one(OptionsPanel)
-        label, values = self.options[panel.cursor]
-        n = len(values) + 1  # off + all values
-        cur = self.option_state.get(label, "")
-        i = (values.index(cur) if cur in values else -1) + delta
-        i %= n
-        self.option_state[label] = "" if i == n - 1 else values[i]
-        save_option_state(self.option_state)
-        panel.refresh()
-        self.update_status()
-
-    def edit_config(self) -> None:
-        if DEMO:
-            self.notify("demo mode — no real config to edit",
-                        severity="warning")
-            return
-        hl = self.query_one(HostList)
-        if not hl.shown:
-            return
-        host = hl.shown[hl.cursor]
-        line = find_config_line(host.host or host.name)
-        if line is None:
-            line = 1
-            self.notify(f"{host.name} not in ~/.ssh/config — opening top",
-                        severity="warning")
-        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-        parts = shlex.split(editor)
-        editor_bin = Path(parts[0]).name
-        if editor_bin == "code":
-            args = parts + ["-g", f"{SSH_CONFIG}:{line}"]
-        elif editor_bin in ("vi", "vim", "nvim", "emacs", "micro"):
-            args = parts + [f"+{line}", str(SSH_CONFIG)]
-        else:
-            args = parts + [str(SSH_CONFIG)]
-            self.notify(f"{editor_bin} can't jump to a line — "
-                        f"opened ~/.ssh/config at top", severity="warning")
-        try:
-            with self.suspend():
-                subprocess.run(args, check=False)
-        except SuspendNotSupported:
-            self.notify("terminal does not support suspend", severity="error")
-            return
-        self.reload()
-
-    def edit_categories(self) -> None:
-        """Open the categories file in $EDITOR, then reload (tabs, colors
-        and categorization rebuild). In demo mode the demo's temp file is
-        edited — safe, and a nice live demo of re-categorization."""
-        path = CATEGORIES_FILE
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(CATEGORIES_TEMPLATE)
-        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-        args = shlex.split(editor) + [str(path)]
-        try:
-            with self.suspend():
-                subprocess.run(args, check=False)
-        except SuspendNotSupported:
-            self.notify("terminal does not support suspend", severity="error")
-            return
-        self.reload()
-
-    # -- keys
-
-    def on_key(self, event: events.Key) -> None:
-        hl = self.query_one(HostList)
-        key = event.key
-        if key in ("ctrl+c", "ctrl+q"):
-            self.exit()
-            event.stop()
-        elif key in ("ctrl+h", "question_mark", "f1"):
-            self.toggle_help()
-            event.stop()
-        elif self.options_open:
-            self.options_key(key)
-            event.stop()
-        elif key == "backspace":
-            hl.filter = hl.filter[:-1]
-            hl.apply_filter()
-            self.update_status()
-            event.stop()
-        elif key == "escape":
-            if hl.filter:
-                hl.filter = ""
+        def on_key(self, event: events.Key) -> None:
+            hl = self.query_one(HostList)
+            key = event.key
+            if key in ("ctrl+c", "ctrl+q"):
+                self.exit()
+                event.stop()
+            elif key in ("ctrl+h", "question_mark", "f1"):
+                self.toggle_help()
+                event.stop()
+            elif self.options_open:
+                self.options_key(key)
+                event.stop()
+            elif key == "backspace":
+                hl.filter = hl.filter[:-1]
                 hl.apply_filter()
                 self.update_status()
-            event.stop()
-        elif key == "up":
-            hl.cursor = max(0, hl.cursor - 1)
-            hl.refresh()
-            self.update_cmd()
-            event.stop()
-        elif key == "down":
-            if hl.shown:
-                hl.cursor = min(len(hl.shown) - 1, hl.cursor + 1)
-            hl.refresh()
-            self.update_cmd()
-            event.stop()
-        elif key == "home":
-            hl.cursor = 0
-            hl.refresh()
-            self.update_cmd()
-            event.stop()
-        elif key == "end":
-            hl.cursor = max(0, len(hl.shown) - 1)
-            hl.refresh()
-            self.update_cmd()
-            event.stop()
-        elif key == "pageup":
-            hl.cursor = max(0, hl.cursor - max(1, hl.size.height - 2))
-            hl.refresh()
-            self.update_cmd()
-            event.stop()
-        elif key == "pagedown":
-            hl.cursor = min(max(0, len(hl.shown) - 1),
-                            hl.cursor + max(1, hl.size.height - 2))
-            hl.refresh()
-            self.update_cmd()
-            event.stop()
-        elif key == "enter":
-            self.do_connect()
-            event.stop()
-        elif key in ("tab", "right"):
-            self.switch_cat(1)
-            event.stop()
-        elif key in ("shift+tab", "backtab", "left"):
-            self.switch_cat(-1)
-            event.stop()
-        elif key == "ctrl+f":
-            self.toggle_favorite()
-            event.stop()
-        elif key == "ctrl+o":
-            self.toggle_options_panel()
-            event.stop()
-        elif key == "ctrl+t":
-            if tmux_available():
-                self.tmux_mode = not self.tmux_mode
-                self.update_status()
-            else:
-                self.notify("tmux is not installed", severity="warning")
-            event.stop()
-        elif key == "ctrl+y":
-            if hl.shown:
-                host = hl.shown[hl.cursor]
-                cmd = " ".join(build_ssh_cmd(host, self.enabled_options()))
-                if copy_to_clipboard(cmd):
-                    self.notify(f"copied: {cmd}")
+                event.stop()
+            elif key == "escape":
+                if hl.filter:
+                    hl.filter = ""
+                    hl.apply_filter()
+                    self.update_status()
+                event.stop()
+            elif key == "up":
+                hl.cursor = max(0, hl.cursor - 1)
+                hl.refresh()
+                self.update_cmd()
+                event.stop()
+            elif key == "down":
+                if hl.shown:
+                    hl.cursor = min(len(hl.shown) - 1, hl.cursor + 1)
+                hl.refresh()
+                self.update_cmd()
+                event.stop()
+            elif key == "home":
+                hl.cursor = 0
+                hl.refresh()
+                self.update_cmd()
+                event.stop()
+            elif key == "end":
+                hl.cursor = max(0, len(hl.shown) - 1)
+                hl.refresh()
+                self.update_cmd()
+                event.stop()
+            elif key == "pageup":
+                hl.cursor = max(0, hl.cursor - max(1, hl.size.height - 2))
+                hl.refresh()
+                self.update_cmd()
+                event.stop()
+            elif key == "pagedown":
+                hl.cursor = min(max(0, len(hl.shown) - 1),
+                                hl.cursor + max(1, hl.size.height - 2))
+                hl.refresh()
+                self.update_cmd()
+                event.stop()
+            elif key == "enter":
+                self.do_connect()
+                event.stop()
+            elif key in ("tab", "right"):
+                self.switch_cat(1)
+                event.stop()
+            elif key in ("shift+tab", "backtab", "left"):
+                self.switch_cat(-1)
+                event.stop()
+            elif key == "ctrl+f":
+                self.toggle_favorite()
+                event.stop()
+            elif key == "ctrl+o":
+                self.toggle_options_panel()
+                event.stop()
+            elif key == "ctrl+t":
+                if tmux_available():
+                    self.tmux_mode = not self.tmux_mode
+                    self.update_status()
                 else:
-                    self.notify(f"no clipboard tool (wl-copy/xclip/xsel/pbcopy) — {cmd}",
-                                severity="warning")
-            event.stop()
-        elif key == "ctrl+e":
-            self.edit_config()
-            event.stop()
-        elif key == "ctrl+g":
-            self.edit_categories()
-            event.stop()
-        elif key == "ctrl+r":
-            self.reload()
-            event.stop()
-        elif key == "ctrl+s":
-            self.open_file_sync()
-            event.stop()
-        elif event.is_printable:
-            hl.filter += event.character
-            hl.apply_filter()
-            self.update_status()
-            event.stop()
+                    self.notify("tmux is not installed", severity="warning")
+                event.stop()
+            elif key == "ctrl+y":
+                if hl.shown:
+                    host = hl.shown[hl.cursor]
+                    cmd = " ".join(build_ssh_cmd(host, self.enabled_options()))
+                    if copy_to_clipboard(cmd):
+                        self.notify(f"copied: {cmd}")
+                    else:
+                        self.notify(f"no clipboard tool (wl-copy/xclip/xsel/pbcopy) — {cmd}",
+                                    severity="warning")
+                event.stop()
+            elif key == "ctrl+e":
+                self.edit_config()
+                event.stop()
+            elif key == "ctrl+g":
+                self.edit_categories()
+                event.stop()
+            elif key == "ctrl+r":
+                self.reload()
+                event.stop()
+            elif key == "ctrl+s":
+                self.open_file_sync()
+                event.stop()
+            elif event.is_printable:
+                hl.filter += event.character
+                hl.apply_filter()
+                self.update_status()
+                event.stop()
+
+
+
+    _TUI = True
+    return SSHWiz
 
 
 # ----------------------------------------------------------- completion
@@ -2564,6 +2584,7 @@ def main() -> None:
 
 def run_main(args: list) -> None:
     if not args:
+        _tui()  # import textual and define the TUI classes (CLI paths skip it)
         SSHWiz().run()
         return
     if args[0] in ("-h", "--help"):

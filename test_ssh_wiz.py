@@ -21,6 +21,7 @@ assert _spec is not None
 shw = importlib.util.module_from_spec(_spec)
 sys.modules["sshwiz"] = shw
 _loader.exec_module(shw)
+shw._tui()  # define the TUI classes; defers the textual import out of module load
 
 _PATH_ATTRS = (
     "SSH_CONFIG",
@@ -886,6 +887,23 @@ class CliTest(TempPathsTestCase):
             self.run_main("foo")
         args = execvp.call_args[0][1]
         self.assertEqual(args[args.index("-o") + 1], "ForwardX11=yes")
+
+
+class LazyTuiTest(unittest.TestCase):
+    def test_cli_path_does_not_import_textual(self):
+        # textual must only be imported when the TUI actually starts: a
+        # CLI invocation (e.g. shell completion) must not pay for it
+        code = (
+            "import sys, runpy\n"
+            "sys.argv = ['ssh-wiz', '--version']\n"
+            f"runpy.run_path({str(HERE / 'ssh-wiz')!r}, run_name='__main__')\n"
+            "assert 'textual' not in sys.modules\n"
+        )
+        # check=False on purpose: the test asserts on r.returncode/r.stderr
+        r = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True, text=True, timeout=60,
+                           check=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class CompletionTest(TempPathsTestCase):
