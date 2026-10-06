@@ -2,7 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [1.2.0] - 2026-10-06
+
+Feature release: twin-panel file sync (`^s`) pushes chosen files from the
+local filesystem to the selected host over rsync, with in-panel delete and
+hidden-file toggling.
 
 ### Added
 
