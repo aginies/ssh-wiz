@@ -11,6 +11,10 @@ reads your `~/.ssh/config` and gets you connected.
 - Fuzzy shell completion for bash, zsh and fish
 - Single file, no build step
 
+## Demo
+
+<video src="ssh-wiz.mp4" controls width="800"></video>
+
 ## Install
 
 Python 3.9+ with Textual and Rich. On SUSE/openSUSE the system package
