@@ -72,10 +72,43 @@ screenshots without exposing real infrastructure.
 | ^y | copy the ssh command for the selected host |
 | ^e | open `~/.ssh/config` at the selected host (`$EDITOR`) |
 | ^g | open `~/.config/ssh-wiz/categories` (`$EDITOR`), then refresh |
+| ^s | open the twin-panel file sync (local → remote push via rsync) |
 | ? / F1 | show full key help (esc/?/F1/q closes) |
 | ^r | refresh host list |
 | esc | clear filter |
 | ^q / ^c | quit |
+
+### File sync (`^s`)
+
+Press `^s` to open a Midnight-Commander-style twin-panel file picker. The left
+panel shows your local filesystem; the right panel shows the filesystem of the
+currently selected host (browsed with `rsync --list-only`).
+
+- `Tab` switches between the local and remote panels; `↑/↓` moves the cursor.
+- `enter`/`right` opens a directory, `left`/`backspace`/`up` goes up.
+- `space` toggles a file, `*` selects all, `/` selects none in the current panel.
+- `h` shows or hides hidden ('dot') files and directories in both panels at once
+  (hidden files are hidden by default).
+- `F5` (or `c`) pushes the chosen local files into the remote panel's current
+  directory using `rsync -a --itemize-changes`, streaming a per-file result list
+  and a progress line.
+- `F8` deletes the file/dir under the cursor in the active panel (locally, or via
+  `ssh … rm -rf` on the remote panel).
+- Selected files use a low-contrast indicator: a green check marks the selection
+  while the name stays normally coloured. The cursor row gets a *subtle* blue
+  background (not a harsh highlight bar) so you can always tell where you are,
+  even after switching panels (`Tab` keeps the cursor on the last item you
+  selected).
+- `?`/`F1` shows sync help, `esc`/`q` closes.
+
+The two panels are separated by a vertical line, the right-hand path bar shows the
+remote host as `user@host`, and a shortcut legend runs along the bottom.
+
+Transfer is **local → remote push only**, uses the host's key auth (no password
+prompt), and requires `rsync` on the remote host — if it is missing a clear
+message is shown instead of running the command. The destination always gets a
+trailing slash, so a file drops into `dest/file` and a directory into
+`dest/dir/`.
 
 ### Shell completion
 

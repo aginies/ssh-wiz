@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Twin-panel file sync (`^s`) — a Midnight-Commander-style local/remote file
+  picker. Browse the local tree on the left and the selected host's filesystem
+  on the right (via `rsync --list-only`), toggle entries with space, navigate
+  directories with Enter/left, select a batch with `*`/`/`, then press `F5`
+  (or `c`) to push the chosen local files into the remote panel's current
+  directory. Transfer uses `rsync -a --itemize-changes` (incremental, preserves
+  metadata) with the host's key auth, and streams a per-file result list with a
+  text progress indicator. Requires `rsync` on the remote host; if it is not
+  present a clear message is shown instead of running the command.
+- `F8` deletes the file/dir under the cursor in the active panel (locally, or via
+  `ssh … rm -rf` when the remote panel is active), with a per-result status line.
+  The remote path is passed to the remote shell as `$1` (not interpolated into the
+  command), so names with spaces/quotes/globs need no quoting and cannot inject a
+  command; a guard also refuses to build a command unless the path is a real file
+  (it can never be empty or `/`), so a missing name can never become `rm -rf -- /`.
+- `h` shows or hides hidden ('dot') files and directories in both panels at once
+  (hidden entries are hidden by default). The local path bar shows a `(hidden)`
+  marker while they are visible.
+- Vertical separator between the two panels, the remote path bar now shows the
+  host as `user@host`, and a shortcut legend runs along the bottom of the screen.
+- Selected entries use a low-contrast indicator: the check turns green while the
+  name stays normally coloured, so only the icon marks a selection. The cursor
+  row gets a *subtle* blue background (not the harsh white of `reverse`) so you
+  always know where you are without a glaring highlight bar.
+- `build_transfer_cmd` core helper (unit-tested) that assembles the rsync
+  command from a host and pick-as-is sources with a trailing-slash destination
+  so a file drops into `dest/file` and a directory into `dest/dir/`
+
+### Notes
+
+- Sync is local → remote push only for now; remote → local pull is a possible
+  follow-up. Key auth only — no password prompt.
+
 ## [1.0.0] - 2026-10-05
 
 First release.

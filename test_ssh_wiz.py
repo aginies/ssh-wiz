@@ -1,5 +1,6 @@
 """Tests for ssh-wiz. Run:  python3 test_ssh_wiz.py  (or: python3 -m unittest)"""
 
+import asyncio
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -999,6 +1000,849 @@ class CompletionCliTest(TempPathsTestCase):
             subprocess.run(
                 cmd, input=out.getvalue(), text=True, check=True, capture_output=True
             )
+
+
+class BuildTransferCmdTest(unittest.TestCase):
+    def make_host(self, **kw):
+        base = {
+            "name": "foo",
+            "display": "alice@foo",
+            "target": "alice@foo",
+            "user": "alice",
+            "host": "foo",
+        }
+        base.update(kw)
+        return shw.Host(**base)
+
+    def test_upload_default(self):
+        h = self.make_host()
+        cmd = shw.build_transfer_cmd(h, [], "up", ["/tmp/a.txt"], "~/")
+        self.assertEqual(cmd[0], "rsync")
+        for flag in ("-a", "-z", "-h", "-i"):
+            self.assertIn(flag, cmd)
+        # -e shell is ssh (no port/identity here)
+        e_i = cmd.index("-e")
+        self.assertEqual(cmd[e_i + 1], "ssh")
+        self.assertIn("/tmp/a.txt", cmd)
+        self.assertIn("alice@foo:~/", cmd[-1])
+
+    def test_upload_embeds_port_identity_and_options(self):
+        h = self.make_host(
+            cmd_port="8022", identityfile="~/.ssh/id_x", extra="-o Foo=bar"
+        )
+        cmd = shw.build_transfer_cmd(
+            h, ["PubkeyAuthentication=no"], "up", ["/tmp/a"], "~/"
+        )
+        shell = cmd[cmd.index("-e") + 1]
+        self.assertIn("-p 8022", shell)  # ssh uses lowercase -p
+        self.assertIn("-i", shell)
+        self.assertIn("id_x", shell)
+        self.assertIn("Foo=bar", shell)
+        self.assertIn("PubkeyAuthentication=no", shell)
+
+    def test_dest_trailing_slash_drops_into_folder(self):
+        h = self.make_host()
+        # file or dir: dest always gets a trailing slash (drop into the folder)
+        for src in ("/tmp/file.txt", "/tmp/dir"):
+            up = shw.build_transfer_cmd(h, [], "up", [src], "/remote")
+            self.assertTrue(up[-1].endswith("/remote/"))
+            self.assertIn(src, up)  # source keeps no trailing slash
+
+    def test_download_direction_swaps_operands(self):
+        h = self.make_host()
+        cmd = shw.build_transfer_cmd(h, [], "down", ["data/file.txt"], "/tmp/out")
+        self.assertIn("alice@foo:data/file.txt", cmd)
+        self.assertTrue(cmd[-1].endswith("/tmp/out/"))
+        # remote source comes before local dest
+        self.assertLess(cmd.index("alice@foo:data/file.txt"), cmd.index("/tmp/out/"))
+
+
+class FileSyncParserTest(unittest.TestCase):
+    def test_parse_rsync_listing(self):
+        out = (
+            "drwxr-xr-x            120 2026/10/06 17:26:43 .\n"
+            "-rw-r--r--              0 2026/10/06 17:26:41 a.txt\n"
+            "-rw-r--r--              7 2026/10/06 17:26:41 b c.txt\n"
+            "drwxr-xr-x             40 2026/10/06 17:26:41 sub\n"
+        )
+        entries = shw.parse_rsync_listing(out)
+        self.assertEqual([e.name for e in entries], ["sub", "a.txt", "b c.txt"])
+        # dirs first, then A->Z; sizes parsed; spaces in names preserved
+        self.assertTrue(entries[0].is_dir)
+        self.assertEqual(entries[1].size, 0)
+        self.assertEqual(entries[2].size, 7)
+
+    def test_parse_rsync_listing_ignores_dot_entries(self):
+        entries = shw.parse_rsync_listing("drwxr-xr-x 1 .\n-rw-r--r-- 2 ../\n")
+        self.assertEqual([e.name for e in entries], [])
+
+    def test_parse_itemize(self):
+        # real rsync --itemize-changes lines carry a leading status char
+        # (``+`` for a plain add, ``c`` for a directory processed by a child)
+        # and the file *type* is the second char (f/d/=).
+        self.assertEqual(shw.parse_itemize("+f+++++++++ a.txt"), ("f", "a.txt"))
+        self.assertEqual(shw.parse_itemize("cd+++++++++ sub/"), ("d", "sub"))
+        self.assertEqual(shw.parse_itemize("+f+++++++++ ./x"), ("f", "x"))
+        self.assertEqual(shw.parse_itemize("cd+++++++++ ./"), None)  # root
+        self.assertIsNone(shw.parse_itemize("not a valid line"))
+
+    def test_list_local_dir_dirs_first_then_alpha(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "b.txt").write_text("x")
+            Path(d, "a.txt").write_text("y")
+            Path(d, "sub").mkdir()
+            entries = shw.list_local_dir(Path(d))
+            self.assertTrue(entries[0].is_dir)  # sub first
+            self.assertEqual([e.name for e in entries[1:]], ["a.txt", "b.txt"])
+
+    def test_fmt_size(self):
+        self.assertEqual(shw.fmt_size(512), "512B")
+        self.assertEqual(shw.fmt_size(1024), "1K")
+        self.assertEqual(shw.fmt_size(1536), "2K")
+
+    def test_parse_progress(self):
+        # (cumulative bytes, pct, speed B/s, xfr-done); speed is rsync's own
+        # rate; xfr is None when the sample has no (xfr#N, ...) suffix
+        b, pct, speed, xfr = shw.parse_progress(
+            "     41,943,040  99%    1.26GB/s    0:00:00 (xfr#1, to-chk=1/3)"
+        )
+        self.assertEqual((b, pct, xfr), (41943040, 99, 1))
+        self.assertAlmostEqual(speed, 1.26e9, delta=1)
+        # de_DE-style grouping and decimal separators
+        b, pct, speed, xfr = shw.parse_progress(
+            "     42.621.440  53%    1,26GB/s    0:00:04 (xfr#1, to-chk=1/2)"
+        )
+        self.assertEqual((b, pct, xfr), (42621440, 53, 1))
+        self.assertAlmostEqual(speed, 1.26e9, delta=1)
+        # -h human-readable size (SI units)
+        b, pct, speed, xfr = shw.parse_progress(
+            "     41.94M  99%    1.15GB/s    0:00:00 (xfr#1, to-chk=1/3)"
+        )
+        self.assertEqual((b, pct, xfr), (41940000, 99, 1))
+        # no xfr# suffix (older rsync), zero speed
+        b, pct, speed, xfr = shw.parse_progress(
+            "     32,768   0%    0.00kB/s    0:00:00"
+        )
+        self.assertEqual((b, pct, speed, xfr), (32768, 0, 0.0, None))
+        self.assertIsNone(shw.parse_progress(">f+++++++++ a.bin"))
+        self.assertIsNone(shw.parse_progress(""))
+
+    def test_fmt_speed(self):
+        self.assertEqual(shw.fmt_speed(120), "120B/s")
+        self.assertEqual(shw.fmt_speed(850000), "850.0kB/s")
+        self.assertEqual(shw.fmt_speed(1.26e9), "1.3GB/s")
+
+
+class _FakeRsyncProc:
+    """Stand-in for an asyncio subprocess: yields itemize lines on stdout.
+    `raw_stdout` feeds the whole byte string in a single read() (for
+    --info=progress2 streams with \r updates)."""
+
+    def __init__(self, itemize_lines=(), returncode=0, stderr="", raw_stdout=None):
+        if raw_stdout is not None:
+            self._chunks = [raw_stdout]
+        else:
+            self._chunks = [l.encode() + b"\n" for l in itemize_lines]
+        self._it = iter(self._chunks)
+        self.returncode = returncode
+        self._stderr = stderr.encode()
+        self.stderr = _FakeStream(self._stderr)
+
+    async def read(self, n=-1):
+        try:
+            return next(self._it)
+        except StopIteration:
+            return b""
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    def __aiter__(self):
+        return self
+
+    @property
+    def stdout(self):
+        return self
+
+    async def wait(self):
+        return self.returncode
+
+    async def communicate(self):
+        return b"", self._stderr
+
+    def kill(self):
+        pass
+
+
+class _StallRsyncProc:
+    """rsync stand-in that stalls on stdout until killed (quit-confirm test)."""
+
+    def __init__(self):
+        self.returncode = None
+        self._killed = asyncio.Event()
+        self.stderr = _FakeStream(b"")
+
+    @property
+    def stdout(self):
+        return self
+
+    async def read(self, n=-1):
+        await self._killed.wait()
+        return b""
+
+    async def wait(self):
+        return -9
+
+    def kill(self):
+        self._killed.set()
+
+
+class _FakeStream:
+    """Stand-in for a subprocess pipe: returns buffered bytes on read()."""
+
+    def __init__(self, data: bytes = b""):
+        self._data = data
+
+    async def read(self):
+        return self._data
+
+
+class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
+    def write_hosts(self):
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+
+    async def test_open_and_switch_panels(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                self.assertIsInstance(app.screen, shw.FileSyncScreen)
+                local = app.screen.query_one("#local-list", shw.FileList)
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                self.assertTrue(local.active)
+                await pilot.press("tab")
+                self.assertTrue(remote.active)
+                await pilot.press("tab")
+                self.assertTrue(local.active)
+
+    async def test_space_toggles_selection_and_counts(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [shw.FileEntry(name="r.txt", path="/tmp/r.txt")]
+                await pilot.press("space")
+                self.assertTrue(local.entries[0].selected)
+                bar = str(app.screen.query_one("#local-path", shw.Static).render())
+                self.assertIn("1 selected", bar)
+                await pilot.press("space")
+                self.assertFalse(local.entries[0].selected)
+
+    async def test_space_toggles_visible_row_not_hidden_entry(self):
+        # The cursor indexes the *visible* rows: with hidden entries present
+        # (the default in any real directory) space must toggle the row shown
+        # on screen, not the invisible entries[cursor].
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name=".hidden", path="/tmp/.hidden"),
+                    shw.FileEntry(name="visible.txt", path="/tmp/visible.txt"),
+                ]
+                self.assertEqual([e.name for e in local.filtered], ["visible.txt"])
+                await pilot.press("space")
+                self.assertTrue(local.entries[1].selected)  # visible.txt
+                self.assertFalse(local.entries[0].selected)  # .hidden untouched
+                bar = str(app.screen.query_one("#local-path", shw.Static).render())
+                self.assertIn("1 selected", bar)
+                # the selection must be *visible*: ☑ on the shown row
+                self.assertIn("☑", str(local.render()))
+
+    async def test_f8_deletes_visible_row_not_hidden_entry(self):
+        # F8 must delete the file under the cursor, never the hidden entry
+        # that shares its index in entries.
+        self.write_hosts()
+        app = shw.SSHWiz()
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        victim = Path(workdir) / "trash.txt"
+        victim.write_text("bye")
+        protected = Path(workdir) / ".keep"
+        protected.write_text("keep me")
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = shw.list_local_dir(workdir)
+                self.assertEqual(local.filtered[0].name, "trash.txt")
+                await pilot.press("f8")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                await pilot.press("y")
+                await pilot.pause()
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+        self.assertFalse(victim.exists())
+        self.assertTrue(protected.exists())
+        self.assertIn("deleted trash.txt", status)
+
+    async def test_cursor_clamps_to_visible_rows(self):
+        # With only one visible row, down/end must not run past it into the
+        # hidden entries.
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name=".a", path="/x/.a"),
+                    shw.FileEntry(name=".b", path="/x/.b"),
+                    shw.FileEntry(name="c.txt", path="/x/c.txt"),
+                ]
+                await pilot.press("down")
+                await pilot.press("down")
+                await pilot.press("end")
+                self.assertEqual(local.cursor, 0)
+                self.assertEqual(local.entry_at_cursor().name, "c.txt")
+
+    async def test_copy_runs_rsync_with_correct_command(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        calls = []
+
+        async def fake_exec(*cmd, **kw):
+            calls.append(cmd)
+            return _FakeRsyncProc(["f+++++++++ r.txt", "cd+++++++++ sub/"])
+
+        with (
+            mock.patch.object(
+                shw.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(side_effect=fake_exec),
+            ),
+            mock.patch.object(shw, "parse_rsync_listing", return_value=[]),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name="r.txt", path="/tmp/r.txt", selected=True)
+                ]
+                await pilot.press("f5")
+                await pilot.pause()
+                await pilot.pause()
+        transfer = [
+            c for c in calls if c and c[0] == "rsync" and "--list-only" not in c
+        ]
+        self.assertTrue(transfer, "expected an rsync transfer command")
+        cmd = transfer[0]
+        self.assertIn("/tmp/r.txt", cmd)
+        self.assertIn("foo:~/", cmd[-1])
+
+    async def test_demo_copy_previews_not_runs(self):
+        shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        app = shw.SSHWiz()
+        with (
+            mock.patch.object(shw.subprocess, "run") as run,
+            mock.patch.object(
+                shw.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(return_value=_FakeRsyncProc(stderr="no rsync")),
+            ),
+            mock.patch.object(shw.SSHWiz, "notify") as notify,
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name="r.txt", path="/tmp/r.txt", selected=True)
+                ]
+                await pilot.press("f5")
+                await pilot.pause()
+        run.assert_not_called()  # demo never runs a real command
+        self.assertTrue(any("would run" in str(c) for c in notify.call_args))
+
+    async def test_f8_deletes_local_file(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        victim = Path(workdir) / "trash.txt"
+        victim.write_text("bye")
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = shw.list_local_dir(workdir)
+                await pilot.press("f8")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                await pilot.press("y")
+                await pilot.pause()
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+        self.assertFalse(victim.exists())
+        self.assertIn("deleted trash.txt", status)
+
+    async def test_f8_asks_confirmation_before_deleting(self):
+        # F8 must never delete without a yes/no prompt: 'n' (or esc) leaves
+        # the file in place and returns to the sync screen.
+        self.write_hosts()
+        app = shw.SSHWiz()
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        victim = Path(workdir) / "trash.txt"
+        victim.write_text("bye")
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = shw.list_local_dir(workdir)
+                # first press: the prompt appears and 'n' cancels
+                await pilot.press("f8")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                msg = (
+                    app.screen.query_one("#confirm-box", shw.Container)
+                    .query_one("Static", shw.Static)
+                    .render()
+                )
+                self.assertIn("trash.txt", str(msg))
+                await pilot.press("n")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.FileSyncScreen)
+                self.assertTrue(victim.exists(), "'n' must not delete")
+                # second press: 'y' confirms and deletes
+                await pilot.press("f8")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                await pilot.press("y")
+                await pilot.pause()
+        self.assertFalse(victim.exists())
+
+    def _remote_roundtrip(self, cmd: list, home: str):
+        """Simulate the ssh round-trip for a delete command: the client joins
+        the remote words with plain spaces, the remote login shell parses the
+        result with -c. Runs it for real against a temp dir as $HOME."""
+        remote_cmd = " ".join(cmd[2:])  # ssh <host> <remote words...>
+        # check=False on purpose: the tests assert on r.returncode/r.stderr
+        return subprocess.run(
+            ["sh", "-c", remote_cmd],
+            env={**os.environ, "HOME": home},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    async def test_f8_deletes_remote_file_via_ssh(self):
+        # The delete must survive the real ssh round-trip: the client joins
+        # the remote words with plain spaces and the remote login shell
+        # re-parses them, so the path must be quoted *inside* the command
+        # string. (The old `sh -c '...' rm $path` argv form lost its quoting
+        # in the join and ran a bare `rm` remotely: "missing operand".)
+        self.write_hosts()
+        app = shw.SSHWiz()
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        victim = Path(workdir) / "old.txt"
+        victim.write_text("bye")
+        calls = []
+
+        async def fake_exec(*cmd, **kw):
+            calls.append(cmd)
+            return _FakeRsyncProc()
+
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=fake_exec),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.press("tab")
+                await pilot.pause()  # let the remote-listing worker settle
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                remote.entries = [shw.FileEntry(name="old.txt", path="old.txt")]
+                await pilot.press("f8")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                await pilot.press("y")
+                await pilot.pause()
+        ssh_calls = [c for c in calls if c and c[0] == "ssh" and "--version" not in c]
+        self.assertTrue(ssh_calls, "expected an ssh delete command")
+        cmd = ssh_calls[0]
+        # a leading ~ must be sent as $HOME so the remote shell expands it
+        remote_cmd = " ".join(cmd[2:])
+        self.assertIn("$HOME", remote_cmd)
+        r = self._remote_roundtrip(cmd, workdir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(victim.exists())
+
+    async def test_f8_remote_delete_quotes_tricky_names(self):
+        # Spaces, single quotes and glob chars in the name must arrive
+        # literally on the remote (no word-splitting, no globbing, no
+        # injection) after the ssh space-join round-trip.
+        self.write_hosts()
+        app = shw.SSHWiz()
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        victims = [Path(workdir) / n for n in ("my file.txt", "we'ird*.txt", "a b")]
+        for v in victims:
+            v.write_text("bye")
+        decoy = Path(workdir) / "keep.txt"  # must not match the glob
+        decoy.write_text("keep")
+        calls = []
+
+        async def fake_exec(*cmd, **kw):
+            calls.append(cmd)
+            return _FakeRsyncProc()
+
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=fake_exec),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.press("tab")
+                await pilot.pause()
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                # each successful delete re-lists the dir (empty here), so
+                # re-seed the entry before every press
+                for name in ("my file.txt", "we'ird*.txt", "a b"):
+                    remote.entries = [shw.FileEntry(name=name, path=name)]
+                    await pilot.press("f8")
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                    await pilot.press("y")
+                    await pilot.pause()
+
+        ssh_calls = [c for c in calls if c and c[0] == "ssh" and "--version" not in c]
+        self.assertEqual(len(ssh_calls), 3)
+        for cmd in ssh_calls:
+            r = self._remote_roundtrip(cmd, workdir)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        for v in victims:
+            self.assertFalse(v.exists(), f"{v.name} should be deleted")
+        self.assertTrue(decoy.exists(), "glob must stay literal")
+
+    async def test_f8_refuses_root_or_empty_remote_path(self):
+        # The target must never be empty or `/`: a missing/empty name must
+        # not become `rm -rf -- /` (or `~/`) on the remote host.
+        self.write_hosts()
+        app = shw.SSHWiz()
+        calls = []
+
+        async def fake_exec(*cmd, **kw):
+            calls.append(cmd)
+            return _FakeRsyncProc()
+
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=fake_exec),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.press("tab")  # active panel = remote
+                await pilot.pause()
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                for remote_path in ("/", "~"):
+                    remote.entries = [shw.FileEntry(name="", path=remote_path)]
+                    app.screen.remote_path = remote_path
+                    await pilot.press("f8")
+                    await pilot.pause()
+                ssh_calls = [
+                    c for c in calls if c and c[0] == "ssh" and "--version" not in c
+                ]
+                self.assertEqual(
+                    ssh_calls, [], "no ssh command may be sent for root/empty paths"
+                )
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+                self.assertIn("cannot delete", status)
+
+    async def test_help_bar_lists_f8_delete(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                helpbar = str(app.screen.query_one("#sync-help", shw.Static).render())
+                self.assertIn("F8", helpbar)
+                self.assertIn("delete", helpbar)
+                # a vertical separator sits between the two columns
+                order = [
+                    w.id for w in app.screen.query_one("#sync-root").walk_children()
+                ]
+                self.assertLess(order.index("sync-sep"), order.index("right-col"))
+                self.assertGreater(order.index("sync-sep"), order.index("local-list"))
+                # the remote path bar shows the host as user@host
+                remote_bar = str(
+                    app.screen.query_one("#remote-path", shw.Static).render()
+                )
+                self.assertIn("alice@foo", remote_bar)
+
+    async def test_selection_has_a_visible_highlight(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name="keep.txt", path="/tmp/keep.txt", selected=True),
+                    shw.FileEntry(name="drop.txt", path="/tmp/drop.txt"),
+                ]
+                local.cursor = 0  # cursor on the *selected* row
+                local.refresh()
+                rendered = local.render()
+
+                def name_style_for(label):
+                    idx = rendered.plain.index(label)
+                    for span in rendered.spans:
+                        if span.start <= idx < span.end:
+                            return str(span.style)
+                    return ""
+
+                # the cursor row gets a *subtle* blue background so you always
+                # know where you are (not the harsh white of reverse)
+                self.assertIn("26405b", name_style_for("keep.txt"))
+                # selected files are indicated only by the icon: the
+                # non-cursor row (drop.txt) is not row-highlighted at all
+                self.assertNotIn("26405b", name_style_for("drop.txt"))
+                self.assertNotIn("reverse", name_style_for("drop.txt"))
+
+    async def test_hidden_files_hidden_by_default_and_toggled(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name="visible.txt", path="/tmp/visible.txt"),
+                    shw.FileEntry(name=".secret", path="/tmp/.secret"),
+                    shw.FileEntry(name=".git", path="/tmp/.git", is_dir=True),
+                ]
+                remote.entries = list(local.entries)
+                # hidden entries are excluded from the visible rows by default
+                self.assertEqual({e.name for e in local.filtered}, {"visible.txt"})
+                rendered = str(local.render())
+                self.assertIn("visible.txt", rendered)
+                self.assertNotIn(".secret", rendered)
+                # pressing h reveals them in BOTH panels at once
+                await pilot.press("h")
+                self.assertTrue(local.show_hidden)
+                self.assertTrue(remote.show_hidden)
+                self.assertEqual(
+                    {e.name for e in local.filtered}, {".git", ".secret", "visible.txt"}
+                )
+                rendered = str(local.render())
+                self.assertIn(".secret", rendered)
+                self.assertIn(".git", rendered)
+                # the status line and the local path bar reflect the state
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+                self.assertIn("hidden files shown", status)
+                local_bar = str(
+                    app.screen.query_one("#local-path", shw.Static).render()
+                )
+                self.assertIn("(hidden)", local_bar)
+                # pressing h again hides them once more
+                await pilot.press("h")
+                self.assertFalse(local.show_hidden)
+                self.assertEqual({e.name for e in local.filtered}, {"visible.txt"})
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+                self.assertIn("hidden files hidden", status)
+                local_bar = str(
+                    app.screen.query_one("#local-path", shw.Static).render()
+                )
+                self.assertNotIn("(hidden)", local_bar)
+
+    async def test_progress_flag_gated_on_rsync_version(self):
+        # --info=progress2 needs rsync >= 3.1 on BOTH ends; an older (or
+        # unknown) remote would reject the flag, so the command must omit it
+        self.write_hosts()
+        for remote_ver, expect in (
+            ((3, 2, 0), True),
+            ((3, 0, 9), False),
+            (None, False),
+        ):
+            app = shw.SSHWiz()
+            calls = []
+
+            async def fake_exec(*cmd, calls=calls, **kw):
+                calls.append(cmd)
+                return _FakeRsyncProc()
+
+            async def no_probe(self):
+                pass
+
+            with (
+                mock.patch.object(
+                    shw.asyncio,
+                    "create_subprocess_exec",
+                    new=mock.AsyncMock(side_effect=fake_exec),
+                ),
+                mock.patch.object(
+                    shw,
+                    "local_rsync_version",
+                    return_value=(3, 2, 0),
+                ),
+                mock.patch.object(shw.FileSyncScreen, "_probe_remote_rsync", no_probe),
+            ):
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await pilot.press("ctrl+s")
+                    app.screen.remote_rsync = remote_ver
+                    local = app.screen.query_one("#local-list", shw.FileList)
+                    local.entries = [
+                        shw.FileEntry(name="r.txt", path="/tmp/r.txt", selected=True)
+                    ]
+                    await pilot.press("f5")
+                    await pilot.pause()
+            transfer = [
+                c for c in calls if c and c[0] == "rsync" and "--list-only" not in c
+            ]
+            self.assertTrue(transfer)
+            self.assertEqual("--info=progress2" in transfer[0], expect)
+
+    async def test_transfer_parses_progress2_stream(self):
+        # progress2 output is \r-separated and interleaved with -i lines;
+        # the transfer must parse cumulative bytes/percent from it
+        self.write_hosts()
+        app = shw.SSHWiz()
+        progress_out = (
+            ">f+++++++++ a.bin\n"
+            "     10.00M  50%    1.00MB/s    0:00:01 (xfr#0, to-chk=1/2)\r"
+            "     20.00M 100%    1.00MB/s    0:00:02 (xfr#2, to-chk=0/2)\n"
+            ">f+++++++++ b.bin\n"
+        )
+
+        async def no_probe(self):
+            pass
+
+        with (
+            mock.patch.object(
+                shw.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(
+                    return_value=_FakeRsyncProc(raw_stdout=progress_out.encode())
+                ),
+            ),
+            mock.patch.object(
+                shw,
+                "local_rsync_version",
+                return_value=(3, 2, 0),
+            ),
+            mock.patch.object(shw.FileSyncScreen, "_probe_remote_rsync", no_probe),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                app.screen.remote_rsync = (3, 2, 0)
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name="a.bin", path="/tmp/a.bin", selected=True),
+                    shw.FileEntry(name="b.bin", path="/tmp/b.bin", selected=True),
+                ]
+                await pilot.press("f5")
+                await pilot.pause()
+                await pilot.pause()
+                status = str(app.screen.query_one("#sync-status", shw.Static).render())
+                self.assertIn("done", status)
+                self.assertEqual(app.screen._xfer_bytes, 20000000)
+                self.assertEqual(app.screen._pct, 100)
+                self.assertAlmostEqual(app.screen._speed, 1.0e6, delta=1)
+
+    async def test_esc_during_transfer_asks_confirmation(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        stall = _StallRsyncProc()
+
+        async def fake_exec(*cmd, **kw):
+            if cmd and cmd[0] == "rsync" and "--list-only" not in cmd:
+                return stall
+            return _FakeRsyncProc()
+
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=fake_exec),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                local.entries = [
+                    shw.FileEntry(name="r.txt", path="/tmp/r.txt", selected=True)
+                ]
+                await pilot.press("f5")
+                await pilot.pause()
+                self.assertTrue(app.screen.busy)
+                # esc must not kill the transfer immediately: it asks first
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                # 'n' cancels: back on the sync screen, transfer still running
+                await pilot.press("n")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.FileSyncScreen)
+                self.assertTrue(app.screen.busy)
+                # 'y' kills the transfer and closes the screen
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.ConfirmScreen)
+                await pilot.press("y")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, shw.FileSyncScreen)
+                self.assertTrue(stall._killed.is_set())
 
 
 if __name__ == "__main__":

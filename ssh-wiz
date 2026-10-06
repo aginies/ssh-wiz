@@ -31,6 +31,7 @@ TUI keys:
   ^o        toggle ssh options panel (cycle -o values: no-pubkey, x11, …)
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
+  ^s        open the file-sync screen (twin-panel, local -> remote)
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
   ^g        open ~/.config/ssh-wiz/categories ($EDITOR), then refresh
   ^h        (alias) — terminals send backspace for ^h, so use ? / F1
@@ -41,6 +42,7 @@ TUI keys:
 """
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import ipaddress
 import json
@@ -602,6 +604,220 @@ def build_ssh_cmd(host: Host, options: list | None = None,
     return cmd
 
 
+@dataclass
+class FileEntry:
+    """One file/dir in a file-sync panel (local or remote)."""
+    name: str
+    path: str
+    is_dir: bool = False
+    is_symlink: bool = False
+    size: int = 0
+    selected: bool = False
+
+    @property
+    def hidden(self) -> bool:
+        """A hidden ('dot') entry: its name starts with '.' (never '.'/'..',
+        which are filtered out when the listing is built)."""
+        return self.name.startswith(".")
+
+
+def _sh_quote(s: str) -> str:
+    """Quote a string for a POSIX shell: single quotes make it fully literal
+    (spaces, globs, $, backticks, ...); an embedded single quote becomes
+    '\'' (close, escaped quote, reopen)."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _rsync_ssh_shell(host: Host, options: list | None = None) -> str:
+    """The `-e` shell rsync uses to reach the host: ssh with the same
+    port/identityfile/options ssh would (ssh's port flag is -p, lowercase)."""
+    parts = ["ssh"]
+    if host.cmd_port:
+        parts += ["-p", host.cmd_port]
+    if host.identityfile:
+        parts += ["-i", os.path.expanduser(host.identityfile)]
+    for opt in options or []:
+        parts += ["-o", opt]
+    if host.extra:
+        try:
+            parts += shlex.split(host.extra)
+        except ValueError:
+            pass  # malformed extra args: already warned at parse time
+    return " ".join(parts)
+
+
+def build_transfer_cmd(host: Host, options: list | None = None,
+                       direction: str = "up",
+                       sources: list | None = None,
+                       dest: str = "~/",
+                       progress: bool = False) -> list:
+    """rsync command for a local<->remote move (local->remote push by default).
+
+    direction='up'   : push local `sources` -> user@host:dest  (upload)
+    direction='down' : pull user@host:sources -> local `dest`   (download)
+
+    `dest` always gets a trailing slash so it behaves like a folder you drop
+    things into (a file -> dest/file, a dir -> dest/dir/). Files/dirs are the
+    item *itself* (no trailing slash on the source), so a directory lands as a
+    new sub-directory rather than spilling its contents.
+
+    `progress` adds --info=progress2 (live overall progress on stdout); needs
+    rsync >= 3.1.0 on both ends, so callers gate it on the probed versions.
+    """
+    sources = list(sources or [])
+    cmd = ["rsync", "-a", "-z", "-h", "-i", "-e", _rsync_ssh_shell(host, options)]
+    if progress:
+        cmd.append("--info=progress2")
+    if direction == "up":
+        for s in sources:
+            cmd.append(os.path.expanduser(s))
+        cmd.append(f"{host.target}:{dest.rstrip('/')}/")
+    else:
+        for s in sources:
+            cmd.append(f"{host.target}:{s.lstrip('/')}")
+        cmd.append(os.path.expanduser(dest).rstrip("/") + "/")
+    return cmd
+
+
+def list_local_dir(path: Path) -> list:
+    """FileEntry list for a local directory (dirs first, then A->Z)."""
+    entries: list = []
+    try:
+        with os.scandir(path) as it:
+            for d in it:
+                try:
+                    is_link = d.is_symlink()
+                    entries.append(FileEntry(
+                        name=d.name, path=d.path,
+                        is_dir=not is_link and d.is_dir(),
+                        is_symlink=is_link,
+                        size=0 if is_link
+                        else d.stat(follow_symlinks=False).st_size))
+                except OSError:
+                    continue
+    except OSError:
+        return entries
+    entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
+    return entries
+
+
+def parse_rsync_listing(output: str) -> list:
+    """Parse `rsync --list-only` lines: 'perms size date time name' (name may
+    contain spaces); dirs first, then A->Z."""
+    entries: list = []
+    for line in output.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) < 5:
+            continue
+        perms, size, _date, _time, name = fields
+        if name.startswith("./"):
+            name = name[2:]
+        if name in (".", ".."):
+            continue
+        try:
+            size_i = int(size)
+        except ValueError:
+            size_i = 0
+        entries.append(FileEntry(
+            name=name, path=name,
+            is_dir=perms.startswith("d"),
+            is_symlink=perms.startswith("l"),
+            size=size_i))
+    entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
+    return entries
+
+
+def parse_itemize(line: str) -> tuple[str, str] | None:
+    """Parse one `rsync --itemize-changes` line -> (type, name), or None.
+    type is 'f' (file), 'd' (dir) or '=' (symlink)."""
+    line = line.rstrip("\n")
+    if " " not in line or len(line) < 12:
+        return None
+    code, name = line.split(" ", 1)
+    ftype = code[1] if len(code) > 1 else ""
+    if ftype == "d":
+        name = name.rstrip("/")
+        return ("d", name) if name not in ("", ".") else None
+    if ftype in ("f", "="):
+        if name.startswith("./"):
+            name = name[2:]
+        return (ftype, name) if name not in (".", "..") else None
+    return None
+
+
+# One --info=progress2 sample (rsync >= 3.1):
+#   <size>  <pct>%  <speed>  <eta>  [(xfr#N, to-chk=A/B)]
+# The size is either a raw byte count with locale digit grouping
+# ('41,943,040', '42.621.440') or, with -h, a human-readable SI value
+# ('41.94M', '41,94M'). Both decimal separators (',' and '.') are accepted,
+# so the parse is locale-proof (the subprocess also runs with LC_ALL=C).
+_PROGRESS_RE = re.compile(
+    r"^(\d+(?:[.,]\d+)*)\s*([KMGTPE])?\s+"
+    r"(\d+(?:[.,]\d+)?)\s*%\s+"
+    r"(\d+(?:[.,]\d+)?)\s*(B|kB|MB|GB|TB|PB)/s"
+    r".*?(?:\(xfr#(\d+), to-chk=\d+/\d+\))?\s*$")
+
+_HUMAN_MULT = {"": 1, "K": 1000, "M": 10**6, "G": 10**9,
+               "T": 10**12, "P": 10**15}
+_SPEED_MULT = {"B": 1, "kB": 1000, "MB": 10**6, "GB": 10**9,
+               "TB": 10**12, "PB": 10**15}
+
+
+def _parse_rsync_size(raw: str, unit: str | None) -> int:
+    """rsync size field -> int bytes (SI units when a suffix is present)."""
+    if unit:
+        return int(float(raw.replace(",", ".")) * _HUMAN_MULT[unit])
+    return int(raw.replace(".", "").replace(",", ""))
+
+
+def parse_progress(segment: str):
+    """Parse one progress2 sample -> (bytes_done, pct, speed, xfr_done), or
+    None. bytes_done is cumulative over the whole transfer; speed is rsync's
+    own rate in bytes/s; xfr_done is None when the sample carries no
+    (xfr#N, ...) suffix."""
+    m = _PROGRESS_RE.match(segment.strip())
+    if not m:
+        return None
+    size_raw, unit, pct_raw, speed_raw, speed_unit, xfr = m.groups()
+    return (_parse_rsync_size(size_raw, unit),
+            int(float(pct_raw.replace(",", "."))),
+            float(speed_raw.replace(",", ".")) * _SPEED_MULT[speed_unit],
+            int(xfr) if xfr else None)
+
+
+def fmt_size(n: int) -> str:
+    """Human-readable byte size (1.2M, 512B, ...)."""
+    if n < 1024:
+        return f"{n}B"
+    for unit in ("K", "M", "G", "T"):
+        n /= 1024
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+    return f"{n:.0f}P"
+
+
+def fmt_speed(bps: float) -> str:
+    """Bytes/second as a compact SI rate (7.9MB/s, 850kB/s, 120B/s)."""
+    for unit, div in (("GB/s", 10**9), ("MB/s", 10**6), ("kB/s", 1000)):
+        if bps >= div:
+            return f"{bps / div:.1f}{unit}"
+    return f"{bps:.0f}B/s"
+
+
+_RSYNC_VER_RE = re.compile(r"version (\d+)\.(\d+)\.(\d+)")
+
+
+def local_rsync_version() -> tuple | None:
+    """(major, minor, patch) of the local rsync, or None if not installed."""
+    try:
+        out = subprocess.run(["rsync", "--version"], capture_output=True,
+                             text=True, check=False)
+    except (FileNotFoundError, OSError):
+        return None
+    m = _RSYNC_VER_RE.search(out.stdout)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
 def find_host(name: str) -> Host:
     hosts = build_hosts()
     for h in hosts:
@@ -658,9 +874,10 @@ def find_config_line(name: str):
 # connect) start without paying for the TUI dependency.
 from textual import events  # noqa: E402
 from textual.app import App, ComposeResult, SuspendNotSupported  # noqa: E402
-from textual.screen import Screen  # noqa: E402
+from textual.screen import ModalScreen, Screen  # noqa: E402
 from textual.widget import Widget  # noqa: E402
-from textual.widgets import Static  # noqa: E402
+from textual.containers import Container, Vertical  # noqa: E402
+from textual.widgets import ProgressBar, Static  # noqa: E402
 
 
 def hints_text() -> str:
@@ -669,7 +886,7 @@ def hints_text() -> str:
              "^f: fav", "^o: opts"]
     if tmux_available():
         parts.append("^t: tmux")
-    parts += ["^y: copy", "^e: edit", "^g: cats",
+    parts += ["^y: copy", "^s: sync", "^e: edit", "^g: cats",
               "esc: clear", "^q: quit"]
     return "    ".join(parts)
 
@@ -693,6 +910,7 @@ def help_text() -> str:
         lines.append("  ^t          toggle tmux mode (tmux new -A -s wiz-<host>)")
     lines += [
         "  ^y          copy the ssh command for the selected host",
+        "  ^s          file-sync screen (twin-panel local -> remote)",
         "  ^e          open ~/.ssh/config at the selected host",
         "  ^g          open categories file, then refresh",
         "  ^h          (terminals send backspace for ^h, so use ? / F1)",
@@ -719,12 +937,48 @@ class HelpScreen(Screen):
     }
     """
 
+    def __init__(self, body: str | None = None) -> None:
+        super().__init__()
+        self._help_body = body if body is not None else help_text()
+
     def compose(self) -> ComposeResult:
-        yield Static(help_text())
+        yield Static(self._help_body)
 
     def on_key(self, event: events.Key) -> None:
         if event.key in ("escape", "ctrl+h", "question_mark", "f1", "q"):
             self.app.pop_screen()
+        event.stop()
+
+
+class ConfirmScreen(ModalScreen):
+    """Small yes/no prompt (modal: dims the screen, swallows every key).
+    y/enter = yes, n/esc/q = no; the answer is returned as the pop result."""
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen #confirm-box {
+        width: auto;
+        border: heavy $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm-box"):
+            yield Static(self._message)
+            yield Static("  [bold yellow]y[/]es      [bold yellow]n[/]o  (esc = no)")
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in ("y", "enter"):
+            self.dismiss(True)
+        elif event.key in ("n", "escape", "q"):
+            self.dismiss(False)
         event.stop()
 
 
@@ -822,6 +1076,737 @@ class HostList(Widget):
 
     def on_resize(self, event) -> None:
         self.refresh()
+
+
+class FileList(Widget):
+    """A checkbox file list for the file-sync screen (local or remote). ↑↓
+    moves the cursor, space toggles selection. Rendered with a ☐/☑ column,
+    a name column and a dim size column; dirs are listed first, then A->Z.
+    Hidden ('dot') entries are hidden unless ``show_hidden`` is set (toggled
+    with ``h`` on the screen). The active panel is highlighted with reverse;
+    selection count lives in the screen's path bar."""
+    can_focus = True
+    DEFAULT_CSS = """
+    FileList {
+        width: 100%;
+        height: 1fr;
+    }
+    FileList.--active {
+        border-left: heavy $primary;
+    }
+    """
+
+    def __init__(self, title: str = "", wid: str | None = None) -> None:
+        super().__init__(id=wid)
+        self.title = title
+        self.entries: list = []
+        self.cursor = 0
+        self.scroll = 0
+        self.filter = ""
+        self.active = False
+        self.error: str | None = None
+        self.show_hidden = False
+
+    @property
+    def filtered(self) -> list:
+        """Visible entries (hidden ones excluded unless ``show_hidden``), then
+        fuzzy-matched against the current text filter."""
+        f = self.filter.lower()
+        rows = [e for e in self.entries if self.show_hidden or not e.hidden]
+        if not f:
+            return rows
+        return [e for e in rows if fuzzy_match(f, e.name.lower())]
+
+    def entry_at_cursor(self):
+        """The entry under the cursor, i.e. the *visible* row at
+        ``self.cursor``. The cursor indexes ``filtered`` (what is rendered),
+        never ``entries`` — hidden entries are not shown, so they must not be
+        addressable by space/F5/F8."""
+        rows = self.filtered
+        if not rows:
+            return None
+        if self.cursor >= len(rows):
+            self.cursor = len(rows) - 1
+        return rows[self.cursor]
+
+    def render(self) -> Text:
+        t = Text(end="")
+        rows = self.filtered
+        if not rows:
+            if self.title == "remote" and self.error:
+                t.append("  remote listing failed: ", style="dim red")
+                t.append(self.error.strip().splitlines()[-1], style="red")
+                return t
+            msg = "empty directory" if self.title == "local" else "loading…"
+            t.append(f"  {msg}", style="dim")
+            return t
+        name_w = min(45, max(14, max(len(e.name) for e in rows) + 2))
+        height = max(1, self.size.height)
+        if self.cursor >= len(rows):
+            self.cursor = len(rows) - 1
+        crow = self.cursor
+        self.scroll = min(self.scroll, crow)
+        if crow >= self.scroll + height - 1:
+            self.scroll = crow - height + 2
+        self.scroll = max(0, self.scroll)
+        for r in range(self.scroll, min(len(rows), self.scroll + height)):
+            e = rows[r]
+            box = "☑" if e.selected else "☐"
+            # The ☑/☐ icon is the selection indicator, so selected rows stay
+            # un-highlighted. The cursor row gets a *subtle* background (not the
+            # harsh white of reverse) so you always know where you are.
+            row_style = Style(bgcolor="#26405b") if r == self.cursor else Style()
+            name = e.name + ("/" if (e.is_dir and not e.is_symlink) else "")
+            line = Text()
+            line.append(f"{box} ", style=("green" if e.selected else "dim"))
+            line.append(f"{name:<{name_w}}", style=row_style)
+            if e.size:
+                line.append(fmt_size(e.size), style=row_style)
+            t.append_text(line)
+            t.append("\n")
+        return t
+
+    def on_resize(self, event) -> None:
+        self.refresh()
+
+
+def sync_help_text() -> str:
+    return "\n".join([
+        "file sync — Midnight Commander style",
+        "",
+        "  Tab        switch local / remote panel",
+        "  ↑/↓        move cursor",
+        "  enter/right  open directory",
+        "  left/back  go up one level",
+        "  space      toggle selection (☐ → ☑)",
+        "  h          show/hide hidden (.files)",
+        "  *          select all    /   select none",
+        "  F5 / c     copy selected local files -> remote",
+        "  ? / F1     this help",
+        "  esc / q    close",
+        "",
+        "  Local -> remote only. rsync must be installed on the",
+        "  remote host (key auth, no password).",
+    ])
+
+
+class FileSyncScreen(Screen):
+    """Twin-panel file manager (Midnight Commander style): the left panel is
+    the local filesystem, the right panel is the selected host's filesystem
+    (key auth only — no password prompt). Select items in the local panel and
+    press F5/c to push them into the remote panel's current directory.
+
+    Local -> remote only. Remote browsing and transfers use rsync, so rsync
+    must be installed on the remote host; otherwise the remote panel reports
+    the error and offers an scp fallback. Modal: while open it swallows every
+    key (nothing falls through to the app)."""
+    CSS = """
+    FileSyncScreen {
+        align: center middle;
+    }
+    #sync-root {
+        layout: horizontal;
+        width: 95%;
+        height: 1fr;
+        border: heavy $primary;
+        padding: 0 1;
+        background: $panel;
+    }
+    #left-col, #right-col {
+        layout: vertical;
+        width: 1fr;
+    }
+    #sync-sep {
+        width: 3;
+        height: 1fr;
+        background: $panel;
+        border-left: heavy $primary;
+        border-right: heavy $primary;
+    }
+    .pathbar {
+        height: 1;
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+    }
+    #sync-status {
+        width: 95%;
+        margin-top: 1;
+        height: auto;
+        min-height: 7;
+        max-height: 14;
+        padding: 0 1;
+        background: $panel;
+        border: heavy $border;
+        overflow-y: auto;
+    }
+    #sync-help {
+        width: 95%;
+        margin-top: 1;
+        min-height: 2;
+        padding: 0 1;
+        background: $panel;
+        border: heavy $border;
+    }
+    #sync-progress {
+        width: 95%;
+        margin-top: 1;
+        margin-bottom: 1;
+        height: 2;
+    }
+    """
+
+    def __init__(self, host: Host) -> None:
+        super().__init__()
+        self.host = host
+        self.active = "local"
+        self.busy = False
+        self.local_path = str(Path.home())
+        self.remote_path = "~"
+        self.remote_error: str | None = None
+        self._transfer_proc = None
+        self._confirm_open = False
+        # probed remote rsync version (gates --info=progress2); None = unknown
+        self.remote_rsync: tuple | None = None
+        # live transfer stats (from --info=progress2, when supported)
+        self._xfer_bytes = 0
+        self._speed = 0.0
+        self._pct = 0
+        self._avg_speed = 0.0
+
+    def compose(self) -> ComposeResult:
+        with Container(id="sync-root"):
+            with Vertical(id="left-col"):
+                yield Static(" local", id="local-path", classes="pathbar")
+                yield FileList("local", "local-list")
+            yield Static("", id="sync-sep")
+            with Vertical(id="right-col"):
+                yield Static(" remote", id="remote-path", classes="pathbar")
+                yield FileList("remote", "remote-list")
+        yield ProgressBar(
+            id="sync-progress", total=0,
+            show_bar=True, show_percentage=True, show_eta=False,
+        )
+        yield Static("select files with space · F5 copy · F8 delete · h hidden · ? help",
+                     id="sync-status")
+        yield Static("", id="sync-help")
+
+    def on_mount(self) -> None:
+        local = self.query_one("#local-list", FileList)
+        remote = self.query_one("#remote-list", FileList)
+        local.entries = list_local_dir(Path(self.local_path))
+        local.active = True
+        remote.active = False
+        remote.error = None
+        local.focus()
+        self._refresh_bars()
+        self._refresh_help()
+        self.query_one("#sync-progress", ProgressBar).display = False
+        self.app.run_worker(self._load_remote())
+        self.app.run_worker(self._probe_remote_rsync())
+
+    async def _confirm_quit(self) -> None:
+        """Esc/q while a transfer runs: ask before killing it. The transfer
+        keeps going in the background while the dialog is open."""
+        try:
+            answer = await self.app.push_screen(
+                ConfirmScreen("Kill the in-progress transfer and quit?"),
+                wait_for_dismiss=True)
+            if answer:
+                if self._transfer_proc is not None:
+                    self._transfer_proc.kill()
+                self.app.pop_screen()
+        finally:
+            self._confirm_open = False
+
+    async def _probe_remote_rsync(self) -> None:
+        """Probe the remote rsync version once (gates --info=progress2, which
+        rsync < 3.1 may reject). Never blocks the screen: on any failure the
+        version stays None and transfers simply omit the flag."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_rsync_ssh_shell(self.host).split(), self.host.target,
+                "rsync", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+        except (FileNotFoundError, OSError):
+            self.remote_rsync = None
+            return
+        m = _RSYNC_VER_RE.search(out.decode(errors="replace"))
+        self.remote_rsync = tuple(int(x) for x in m.groups()) if m else None
+
+    # -- panels / path bars
+
+    def _active_list(self) -> FileList:
+        return self.query_one(
+            "#local-list" if self.active == "local" else "#remote-list",
+            FileList)
+
+    def _refresh_bars(self) -> None:
+        local = self.query_one("#local-list", FileList)
+        remote = self.query_one("#remote-list", FileList)
+        n_local = sum(1 for e in local.entries if e.selected)
+        n_remote = sum(1 for e in remote.entries if e.selected)
+        marker = " [dim](hidden)[/]" if local.show_hidden else ""
+        self.query_one("#local-path", Static).update(
+            f" local  {self.local_path}   [bold]{n_local} selected[/]{marker}")
+        err = f"  [red]✗ {self.remote_error}[/]" if self.remote_error else ""
+        self.query_one("#remote-path", Static).update(
+            f" remote  {self.host.display}  {self.remote_path}{err}   "
+            f"[bold]{n_remote} selected[/]")
+
+    # -- navigation
+
+    def _switch_panel(self) -> None:
+        self.active = "remote" if self.active == "local" else "local"
+        want = "#local-list" if self.active == "local" else "#remote-list"
+        for _id in ("#local-list", "#remote-list"):
+            self.query_one(_id, FileList).active = (_id == want)
+        self._active_list().focus()
+        self._refresh_bars()
+
+    def _open_dir(self) -> None:
+        lst = self._active_list()
+        e = lst.entry_at_cursor()
+        if e is None or not e.is_dir:
+            return
+        if self.active == "local":
+            self.local_path = e.path
+            lst.entries = list_local_dir(Path(self.local_path))
+        else:
+            self.remote_path = self.remote_path.rstrip("/") + "/" + e.name
+            self.app.run_worker(self._load_remote())
+        lst.cursor, lst.scroll = 0, 0
+        lst.refresh()
+        self._refresh_bars()
+
+    def _go_up(self) -> None:
+        lst = self._active_list()
+        if self.active == "local":
+            self.local_path = str(Path(self.local_path).parent)
+            lst.entries = list_local_dir(Path(self.local_path))
+        else:
+            rp = self.remote_path.rstrip("/")
+            self.remote_path = rp.rsplit("/", 1)[0] if "/" in rp else ""
+            self.app.run_worker(self._load_remote())
+        lst.cursor, lst.scroll = 0, 0
+        lst.refresh()
+        self._refresh_bars()
+
+    # -- hidden files
+
+    def _toggle_hidden(self) -> None:
+        """Show or hide hidden ('dot') files and directories in both panels."""
+        local = self.query_one("#local-list", FileList)
+        state = not local.show_hidden
+        for wid in ("#local-list", "#remote-list"):
+            lst = self.query_one(wid, FileList)
+            lst.show_hidden = state
+            lst.refresh()
+        self._update_status(
+            "hidden files shown" if state else "hidden files hidden")
+        self._refresh_bars()
+
+    # -- selection
+
+    def _toggle_select(self) -> None:
+        lst = self._active_list()
+        e = lst.entry_at_cursor()
+        if e is not None:
+            e.selected = not e.selected
+            lst.refresh()
+            self._refresh_bars()
+
+    def _select_all(self, on: bool) -> None:
+        lst = self._active_list()
+        for e in lst.filtered:  # only what is visible can be selected
+            e.selected = on
+        lst.refresh()
+        self._refresh_bars()
+
+    # -- remote listing
+
+    async def _load_remote(self) -> None:
+        remote = self.query_one("#remote-list", FileList)
+        url = f"{self.host.target}:{self.remote_path.rstrip('/')}/"
+        cmd = ["rsync", "--list-only", "-h", "-e", _rsync_ssh_shell(self.host), url]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+        except FileNotFoundError:
+            remote.error = "rsync is not installed locally"
+            self.remote_error = remote.error
+            remote.entries = []
+            remote.cursor, remote.scroll = 0, 0
+            remote.refresh()
+            self._refresh_bars()
+            return
+        if proc.returncode != 0:
+            detail = err.decode(errors="replace").strip()
+            remote.error = detail or f"rsync exited {proc.returncode}"
+            self.remote_error = remote.error
+            remote.entries = []
+        else:
+            remote.error = None
+            self.remote_error = None
+            remote.entries = parse_rsync_listing(out.decode(errors="replace"))
+        remote.cursor, remote.scroll = 0, 0
+        remote.refresh()
+        self._refresh_bars()
+
+    # -- transfer
+
+    def do_copy(self) -> None:
+        local = self.query_one("#local-list", FileList)
+        selected = [e for e in local.entries if e.selected]
+        if not selected:
+            self.app.notify("nothing selected — mark files with space",
+                            title="sync", severity="warning")
+            return
+        if DEMO:
+            cmd = " ".join(build_transfer_cmd(
+                self.host, self.app.enabled_options(), "up",
+                [e.path for e in selected], self.remote_path))
+            self.app.notify(f"demo mode — would run:\n{cmd}", title="sync")
+            return
+        self.busy = True
+        self._set_progress(0, len(selected), "transferring…")
+        self._update_status(
+            f"⏳ transferring {len(selected)} item(s) → "
+            f"{self.host.display}:{self.remote_path}…")
+        # live bandwidth needs --info=progress2: rsync >= 3.1 on BOTH ends
+        progress = (local_rsync_version() or (0,)) >= (3, 1, 0) and \
+            (self.remote_rsync or (0,)) >= (3, 1, 0)
+        cmd = build_transfer_cmd(
+            self.host, self.app.enabled_options(), "up",
+            [e.path for e in selected], self.remote_path,
+            progress=progress)
+        self.app.run_worker(self._run_sync(cmd, len(selected), progress))
+
+    async def _run_sync(self, cmd: list, total: int, progress: bool) -> None:
+        done = 0
+        items: list = []
+        self._xfer_bytes = 0
+        self._speed = 0.0
+        self._pct = 0
+        self._avg_speed = 0.0
+        t0 = time.monotonic()
+
+        def feed(segment: str) -> None:
+            """Consume one \n-delimited segment of rsync stdout. With
+            --info=progress2 a segment may hold an itemize line, a progress
+            sample, or both (progress updates are \r-separated and can glue
+            onto the next line), so each \r-part is tried against both."""
+            nonlocal done
+            for part in segment.split("\r"):
+                it = parse_itemize(part)
+                if it:
+                    items.append(it)
+                    if not progress:  # without progress2, -i lines arrive on
+                        done += 1     # completion; with it, they arrive on
+                                      # start, so xfr# below counts instead
+                if progress:
+                    pg = parse_progress(part)
+                    if pg:
+                        b, pct, speed, xfr = pg
+                        self._xfer_bytes = b
+                        self._pct = pct
+                        self._speed = speed
+                        if xfr is not None:
+                            done = xfr
+                        self._render_sync_status(items, done, total,
+                                                 "transferring…", None)
+
+        try:
+            # LC_ALL=C: stable number format in progress samples (some
+            # locales use ',' decimals / lakh grouping)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            self._transfer_proc = proc
+            err_task = asyncio.create_task(proc.stderr.read())
+            buf = ""
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buf += chunk.decode(errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    feed(line)
+                if buf:  # in-progress tail (live \r updates)
+                    feed(buf)
+                    buf = ""
+            await proc.wait()
+            err = await err_task
+        except FileNotFoundError:
+            # no rsync locally: report it, and let the finally below clear
+            # self.busy or the screen would swallow every key but escape
+            self._render_sync_status([], 0, 0, None,
+                                     "rsync is not installed locally")
+            self.app.notify("rsync is not installed locally — install it "
+                            "to use file sync", title="sync",
+                            severity="error")
+            return
+        finally:
+            self._transfer_proc = None
+            self.busy = False
+        if not self.is_mounted:
+            return  # screen closed (e.g. transfer killed + quit)
+        elapsed = time.monotonic() - t0
+        if elapsed > 0 and self._xfer_bytes:
+            self._avg_speed = self._xfer_bytes / elapsed
+        if proc.returncode != 0 and not items:
+            self._render_sync_status([], 0, 0, None,
+                                     "rsync failed on the remote host")
+            self.app.notify("transfer failed — is rsync installed on the "
+                            f"remote host ({self.host.display})?",
+                            title="sync", severity="error")
+            return
+        self._render_sync_status(items, done, total, "done", None)
+        # refresh the remote panel so what just arrived is visible
+        self.app.run_worker(self._load_remote())
+        local = self.query_one("#local-list", FileList)
+        for e in local.entries:
+            e.selected = False
+        local.refresh()
+
+    def _render_sync_status(self, items, done, total, state, error) -> None:
+        self._set_progress(done, total, state)
+        status = self.query_one("#sync-status", Static)
+        t = Text(end="")
+        if error:
+            t.append("  transfer failed:\n", style="bold red")
+            for line in error.strip().splitlines()[:10]:
+                t.append(f"  {line}\n", style="red")
+            status.update(t)
+            return
+        files = sum(1 for ty, _ in items if ty == "f")
+        dirs = sum(1 for ty, _ in items if ty == "d")
+        syms = sum(1 for ty, _ in items if ty == "=")
+        if state == "done":
+            t.append(f" ✓ done  {files} file(s), {dirs} dir(s)",
+                     style="bold green")
+            if syms:
+                t.append(f", {syms} symlink(s)", style="bold cyan")
+            if self._avg_speed > 0:
+                t.append(f"  ·  avg {fmt_speed(self._avg_speed)}",
+                         style="dim")
+        else:
+            t.append(f" ⏳ {state} {done}/{total}…", style="bold cyan")
+            if self._speed > 0:
+                t.append(f"  ·  {fmt_speed(self._speed)}", style="dim")
+            if self._pct:
+                t.append(f"  ·  {self._pct}%", style="dim")
+        t.append("\n")
+        for ty, name in items:
+            if ty == "f":
+                t.append(f"  → {name}\n", style="green")
+            elif ty == "d":
+                t.append(f"  ↗ {name}/\n", style="dim")
+            else:
+                t.append(f"  ↷ {name}\n", style="cyan")
+        status.update(t)
+
+    def _update_status(self, text: str) -> None:
+        self.query_one("#sync-status", Static).update(Text(text))
+
+    def _set_progress(self, done: int, total: int, state: str) -> None:
+        """Show and update the transfer progress bar.
+
+        The bar is hidden unless a transfer is in progress (``state`` is
+        ``"transferring…"``) or just finished (``"done"``); otherwise (error or
+        idle) it is hidden so it does not sit empty at the bottom of the screen.
+        """
+        bar = self.query_one("#sync-progress", ProgressBar)
+        if state in ("transferring…", "done"):
+            bar.display = True
+            bar.update(total=total, progress=min(done, total))
+        else:
+            bar.display = False
+
+    def _refresh_help(self) -> None:
+        """Render the shortcut legend shown at the bottom of the screen."""
+        bar = self.query_one("#sync-help", Static)
+        t = Text(end="")
+        for row in (
+            [("space", "select"), ("*", "all"), ("/", "none"),
+             ("h", "hidden"), ("↵", "open"), ("←", "up")],
+            [("F5/c", "copy"), ("F8", "delete"),
+             ("?/F1", "help"), ("esc", "close")],
+        ):
+            for key, action in row:
+                t.append(f"  {key:<6}", style="bold yellow")
+                t.append(f"{action}  ", style="dim")
+            t.append("\n")
+        t.rstrip()
+        bar.update(t)
+
+    # -- delete (F8)
+
+    async def _delete_selected(self) -> None:
+        """F8: ask for confirmation, then delete the entry under the cursor.
+        A directory's contents go with it, so the prompt says so."""
+        lst = self._active_list()
+        e = lst.entry_at_cursor()
+        if e is None:
+            return
+        if e.name:
+            if e.is_dir and not e.is_symlink:
+                msg = f"Delete {e.name}/ and all its contents?"
+            else:
+                msg = f"Delete {e.name}?"
+            answer = await self.app.push_screen(
+                ConfirmScreen(msg), wait_for_dismiss=True)
+            if not answer:
+                return
+        if self.active == "local":
+            self._delete_local(e)
+        else:
+            self.app.run_worker(self._delete_remote(e))
+
+    def _delete_local(self, e) -> None:
+        try:
+            if e.is_dir and not e.is_symlink:
+                shutil.rmtree(e.path)
+            else:
+                os.remove(e.path)
+        except OSError as ex:
+            self._update_status(f"✗ could not delete {e.name}: {ex}")
+            return
+        local = self.query_one("#local-list", FileList)
+        local.entries = list_local_dir(Path(self.local_path))
+        local.cursor, local.scroll = 0, 0
+        local.refresh()
+        self._refresh_bars()
+        self._update_status(f"deleted {e.name}")
+
+    async def _delete_remote(self, e) -> None:
+        full = self.remote_path.rstrip("/") + "/" + e.name
+        # Safety: the target must never be empty or the whole filesystem/home.
+        # Reject the root ("/", "//") and the home root ("~", "~/") before we
+        # ever build or send the command, so a missing/empty name can never
+        # become `rm -rf -- /`.
+        root = full.rstrip("/")
+        if not root or root == "~":
+            self._update_status(f"✗ cannot delete {e.name}")
+            return
+        # The ssh client joins the remote words with plain spaces before the
+        # remote login shell parses them, so the path must be quoted *inside
+        # the command string* (single quotes: fully literal, also defeats
+        # globs and injection). A leading ~ is sent as $HOME so the remote
+        # shell expands it.
+        if full.startswith("~"):
+            remote_cmd = f'rm -rf -- "$HOME"{_sh_quote(full[1:])}'
+        else:
+            remote_cmd = f"rm -rf -- {_sh_quote(full)}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_rsync_ssh_shell(self.host).split(), self.host.target,
+                remote_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await proc.communicate()
+        except FileNotFoundError:
+            self._update_status("✗ ssh is not installed locally")
+            return
+        if proc.returncode != 0:
+            detail = (err.decode(errors="replace").strip()
+                      or f"exited {proc.returncode}")
+            self._update_status(f"✗ could not delete {e.name}: {detail}")
+            return
+        self.app.run_worker(self._load_remote())
+        self._update_status(f"deleted {e.name} from remote")
+
+    # -- keys
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        if self.busy:
+            if key in ("escape", "q", "ctrl+q") and not self._confirm_open:
+                self._confirm_open = True
+                event.stop()
+                # don't kill a running transfer on the first esc: ask
+                self.app.run_worker(self._confirm_quit())
+            event.stop()
+            return
+        if key in ("escape", "q", "ctrl+q"):
+            self.app.pop_screen()
+            event.stop()
+            return
+        if key in ("tab", "f7"):
+            self._switch_panel()
+            event.stop()
+        elif key in ("f5", "c"):
+            self.do_copy()
+            event.stop()
+        elif key == "f8":
+            self.app.run_worker(self._delete_selected())
+            event.stop()
+        elif key == "up":
+            lst = self._active_list()
+            lst.cursor = max(0, lst.cursor - 1)
+            lst.refresh()
+            event.stop()
+        elif key == "down":
+            lst = self._active_list()
+            lst.cursor = min(len(lst.filtered) - 1, lst.cursor + 1)
+            lst.refresh()
+            event.stop()
+        elif key == "pageup":
+            lst = self._active_list()
+            lst.cursor = max(0, lst.cursor - max(1, lst.size.height - 2))
+            lst.refresh()
+            event.stop()
+        elif key == "pagedown":
+            lst = self._active_list()
+            lst.cursor = min(max(0, len(lst.filtered) - 1),
+                             lst.cursor + max(1, lst.size.height - 2))
+            lst.refresh()
+            event.stop()
+        elif key == "home":
+            self._active_list().cursor = 0
+            self._active_list().refresh()
+            event.stop()
+        elif key == "end":
+            lst = self._active_list()
+            lst.cursor = max(0, len(lst.filtered) - 1)
+            lst.refresh()
+            event.stop()
+        elif key in ("enter", "right"):
+            self._open_dir()
+            event.stop()
+        elif key in ("backspace", "left"):
+            self._go_up()
+            event.stop()
+        elif key == "space":
+            self._toggle_select()
+            event.stop()
+        elif key == "*":
+            self._select_all(True)
+            event.stop()
+        elif key == "/":
+            self._select_all(False)
+            event.stop()
+        elif key == "h":
+            self._toggle_hidden()
+            event.stop()
+        elif key in ("question_mark", "f1"):
+            self.app.push_screen(HelpScreen(sync_help_text()))
+            event.stop()
+        elif event.is_printable:
+            self._active_list().filter += event.character
+            self._active_list().refresh()
+            event.stop()
 
 
 class OptionsPanel(Widget):
@@ -1084,6 +2069,16 @@ class SSHWiz(App):
             return
         self.connect_to(hl.shown[hl.cursor])
 
+    def open_file_sync(self) -> None:
+        """Open the twin-panel file-sync screen (Ctrl+S) for the selected
+        host: local filesystem on the left, the host's filesystem on the
+        right. Local -> remote only (key auth, no password)."""
+        hl = self.query_one(HostList)
+        if not hl.shown:
+            self.app.notify("no hosts shown — select one first", title="sync", severity="warning")
+            return
+        self.push_screen(FileSyncScreen(hl.shown[hl.cursor]))
+
     # -- options panel (^o)
 
     def enabled_options(self) -> list:
@@ -1294,6 +2289,9 @@ class SSHWiz(App):
             event.stop()
         elif key == "ctrl+r":
             self.reload()
+            event.stop()
+        elif key == "ctrl+s":
+            self.open_file_sync()
             event.stop()
         elif event.is_printable:
             hl.filter += event.character
