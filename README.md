@@ -13,7 +13,7 @@ reads your `~/.ssh/config` and gets you connected.
 
 ## Demo
 
-<video src="ssh-wiz.mp4" controls width="800"></video>
+![ssh-wiz demo](ssh-wiz.gif)
 
 ## Install
 
