@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.3.0] - 2026-10-07
+
+Feature release: an add-host wizard (`^a`) that onboards a new host end to
+end — pick or generate a key, install it, verify key auth, and append a
+backed-up `~/.ssh/config` block — plus a batch of performance and correctness
+fixes to the picker and the file-sync screen.
+
+### Added
+
+- Add-host wizard (`^a`): a form (host, port, user, optional alias, key) that
+  walks through onboarding a host in staged steps. Pick an existing keypair or
+  generate a per-host ed25519 key, install it with `ssh-copy-id` (the password
+  is entered on the handed-over terminal), verify key auth with a `BatchMode`
+  probe (no config write on failure unless confirmed), then back up
+  `~/.ssh/config` to `.bak` and append the host block. A live preview shows the
+  exact block that will be written and warns about earlier `Host` patterns that
+  would shadow it. Any failure keeps the form open so you can retry in place;
+  `esc`/`q` cancels without touching anything.
+- Host/port validation in the wizard: the port field is digits-only (letters
+  can't be typed or pasted) and the host is validated as an IPv4/IPv6 address
+  or a DNS name, with a subtle red tint on a field while it holds an unusable
+  value and a clear error on submit.
+- Pure, unit-tested onboarding helpers: `NewHost`, `valid_host`/`valid_port`,
+  `build_copyid_cmd`, `build_probe_cmd`, `classify_probe`, `find_ssh_keys`,
+  `generate_key`, `backup_ssh_config`, `render_config_block`,
+  `config_has_host`, `wildcard_shadows` and `append_host_to_config`.
+
+### Fixed
+
+- Remote file listing broken when the ssh config sets `ControlPath=%t` (a
+  regression in 1.2.0).
+- Keys leaking to the background host list while an overlay screen (help /
+  confirm / add-host / file-sync) is active: the app-level key handler now
+  ignores non-quit keys while such a screen is on the stack, so the wizard and
+  other overlays own the keyboard.
+
+### Changed
+
+- Performance: config file reads are cached by mtime; the local directory
+  listing runs off the UI thread; `FileList.filtered` is cached; the command
+  preview re-lays out only when the command changes; the transfer status is
+  throttled and capped; the sync screen reuses one SSH connection; and textual
+  is imported only when the TUI actually starts (faster `--version`/CLI).
+
 ## [1.2.0] - 2026-10-06
 
 Feature release: twin-panel file sync (`^s`) pushes chosen files from the
