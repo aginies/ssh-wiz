@@ -32,6 +32,7 @@ TUI keys:
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
   ^s        open the file-sync screen (twin-panel, local -> remote)
+  ^a        add host (wizard: key, ssh-copy-id, config block)
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
   ^g        open ~/.config/ssh-wiz/categories ($EDITOR), then refresh
   ^h        (alias) — terminals send backspace for ^h, so use ? / F1
@@ -50,6 +51,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -912,10 +914,11 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def find_config_line(name: str):
-    """1-based line of the 'Host <name>' block in ~/.ssh/config, or None."""
+def find_config_line(name: str, path: Path | None = None):
+    """1-based line of the 'Host <name>' block in the ssh config (or
+    `path`), or None."""
     try:
-        lines = SSH_CONFIG.read_text().splitlines()
+        lines = (path or SSH_CONFIG).read_text().splitlines()
     except OSError:
         return None
     for i, raw in enumerate(lines, 1):
@@ -923,6 +926,288 @@ def find_config_line(name: str):
         if len(parts) >= 2 and parts[0].lower() == "host" and name in parts[1].split():
             return i
     return None
+
+
+# ------------------------------------- host onboarding (wizard core, phase 1)
+
+# Pure helpers for the host onboarding wizard: the TUI screen (phase 2) and
+# the --add CLI (phase 3) build on these. No UI here; the only subprocesses
+# are ssh-keygen (generate_key) and the commands the callers exec themselves.
+
+PROBE_TIMEOUT = 3            # ConnectTimeout for the verification probe
+KEYGEN_TYPE = "ed25519"      # what generate_key creates
+CONFIG_BACKUP_SUFFIX = ".bak"  # <config>.bak: the previous full config
+
+
+@dataclass
+class NewHost:
+    """Spec for a host to onboard: what to connect to and what to write to
+    ~/.ssh/config. port is a string (ssh -p takes one); check it with
+    valid_port() before use."""
+    host: str              # hostname or IP (the ssh target)
+    user: str
+    port: str = "22"
+    name: str = ""         # Host block name (alias); defaults to host
+    key: str = ""          # identity file (private key); "" = ssh defaults
+
+    @property
+    def block_name(self) -> str:
+        """The Host block name: the alias, or the host itself."""
+        return self.name or self.host
+
+    @property
+    def target(self) -> str:
+        """user@host as passed to ssh / ssh-copy-id."""
+        return f"{self.user}@{self.host}"
+
+
+def valid_port(port: str) -> bool:
+    """A usable ssh port: an integer in 1..65535."""
+    return port.isdigit() and 1 <= int(port) <= 65535
+
+
+def valid_host(host: str) -> bool:
+    """A usable ssh target: an IPv4/IPv6 address, or a DNS hostname
+    (letters, digits, '.', '-', '_'; no empty labels, no leading/trailing
+    '-' or '.', <= 253 chars). A dotted string of only digits must be a
+    valid IPv4 address (so '999.1.1.1' is rejected)."""
+    h = host.strip()
+    if not h or len(h) > 253:
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    if "." in h and h.replace(".", "").isdigit():   # looks like IPv4, isn't
+        return False
+    if not re.fullmatch(r"[a-z0-9._-]+", h, re.IGNORECASE):
+        return False
+    return (".." not in h
+            and not h.startswith((".", "-"))
+            and not h.endswith("-"))
+
+
+def _port_args(port: str) -> list:
+    """['-p', port] for a non-default port, [] otherwise."""
+    return ["-p", port] if port and port != "22" else []
+
+
+def build_copyid_cmd(spec: NewHost) -> list:
+    """ssh-copy-id command installing spec.key on the host.
+
+    No -f: re-runs are idempotent (an already-present key is reported, not
+    duplicated). The password is entered by the user on the handed-over
+    terminal (the caller runs this inside App.suspend())."""
+    cmd = ["ssh-copy-id", "-i", spec.key]
+    cmd += _port_args(spec.port)
+    cmd.append(spec.target)
+    return cmd
+
+
+def build_probe_cmd(spec: NewHost) -> list:
+    """Key-auth verification probe: ssh in BatchMode (never prompts) and
+    run `true`; exit 0 means the key works without a password.
+
+    BatchMode=yes disables password/keyboard-interactive auth, so this can
+    never hang on a prompt — safe to run from the TUI. With no spec.key the
+    defaults are used (ssh finds ~/.ssh/id_* itself)."""
+    cmd = ["ssh", "-o", "BatchMode=yes",
+           "-o", f"ConnectTimeout={PROBE_TIMEOUT}"]
+    cmd += _port_args(spec.port)
+    if spec.key:
+        cmd += ["-i", spec.key]
+    cmd += [spec.target, "true"]
+    return cmd
+
+
+def classify_probe(rc: int, stderr: str) -> str:
+    """Probe result -> 'ok' (key auth works), 'nokey' (host up but refused
+    key auth) or 'down' (unreachable / anything else).
+
+    'Permission denied' in the ssh stderr is the only signature trusted for
+    nokey; timeouts, refusals, DNS failures and unknown errors all read as
+    down. The caller runs the probe with LC_ALL=C, so the message is the
+    English one."""
+    if rc == 0:
+        return "ok"
+    if "Permission denied" in stderr:
+        return "nokey"
+    return "down"
+
+
+@dataclass
+class SshKey:
+    """One local keypair: the private key at `path` (named `name`), with
+    type/comment parsed from the matching .pub file."""
+    name: str      # private key file name, e.g. 'id_ed25519'
+    path: Path     # private key file
+    type: str      # key type from the .pub, e.g. 'ssh-ed25519'
+    comment: str   # .pub comment ("" when the .pub has none)
+
+
+def find_ssh_keys(directory: Path | None = None) -> list:
+    """Keypairs in ~/.ssh (or `directory`): private files matching id_*
+    with a matching .pub, sorted by name. A missing directory, unreadable
+    or malformed .pub is skipped, never fatal."""
+    d = directory or (Path.home() / ".ssh")
+    keys = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if not e.name.startswith("id_") or e.name.endswith(".pub"):
+                    continue
+                if not e.is_file():
+                    continue
+                pub = Path(e.path + ".pub")
+                if not pub.is_file():
+                    continue
+                try:
+                    line = pub.read_text().strip()
+                except OSError:
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) < 2 or not parts[1]:
+                    continue
+                keys.append(SshKey(
+                    name=e.name, path=Path(e.path), type=parts[0],
+                    comment=parts[2] if len(parts) > 2 else ""))
+    except OSError:
+        return []
+    keys.sort(key=lambda k: k.name)
+    return keys
+
+
+def sanitize_key_name(host: str) -> str:
+    """Per-host key file name: id_ed25519_<host> with every run of chars
+    outside [A-Za-z0-9._-] replaced by '-' (2001:db8::1 ->
+    id_ed25519_2001-db8-1). A host with no usable chars becomes
+    id_ed25519_host."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", host).strip("-.")
+    return "id_ed25519_" + (s or "host")
+
+
+def generate_key(host: str, user: str, directory: Path | None = None) -> Path:
+    """Generate a per-host ed25519 keypair (empty passphrase) at
+    ~/.ssh/id_ed25519_<host> (or `directory`) and return the private key
+    path.
+
+    Raises FileExistsError if the key (or its .pub) is already there — the
+    caller asks the user whether to reuse it, never overwrites — and
+    RuntimeError when ssh-keygen is missing or fails."""
+    d = directory or (Path.home() / ".ssh")
+    path = d / sanitize_key_name(host)
+    if path.exists() or (d / (path.name + ".pub")).exists():
+        raise FileExistsError(str(path))
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["ssh-keygen", "-t", KEYGEN_TYPE, "-N", "",
+             "-C", f"{user}@{host}", "-f", str(path)],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise RuntimeError("ssh-keygen is not installed")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ssh-keygen failed: {proc.stderr.strip()}")
+    return path
+
+
+def backup_ssh_config(path: Path | None = None) -> Path | None:
+    """Copy the current ssh config (or `path`) to <config>.bak — atomic,
+    mode 0600 (the backup holds the whole config) — and return the backup
+    path. Returns None when there is no config yet (nothing to back up).
+
+    Refreshed on every write, so the .bak always holds the *immediately*
+    previous state; restore with `cp <config>.bak <config>`."""
+    path = path or SSH_CONFIG
+    try:
+        path.stat()
+    except OSError:
+        return None
+    bak = path.with_name(path.name + CONFIG_BACKUP_SUFFIX)
+    tmp = bak.with_name(bak.name + ".tmp")
+    shutil.copyfile(path, tmp)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, bak)
+    return bak
+
+
+def render_config_block(spec: NewHost, when: str | None = None) -> str:
+    """The ~/.ssh/config block for spec, as text (ends with a newline).
+
+    Redundant lines are omitted: HostName only when the block name is an
+    alias, Port only when it is not 22. User and IdentityFile are always
+    written (IdentityFile when a key is set) — that is what makes the host
+    connectable with a key."""
+    when = when or time.strftime("%Y-%m-%d")
+    lines = [f"# added by ssh-wiz on {when}", f"Host {spec.block_name}"]
+    if spec.host != spec.block_name:
+        lines.append(f"    HostName {spec.host}")
+    if spec.port and spec.port != "22":
+        lines.append(f"    Port {spec.port}")
+    lines.append(f"    User {spec.user}")
+    if spec.key:
+        lines.append(f"    IdentityFile {spec.key}")
+    return "\n".join(lines) + "\n"
+
+
+def config_has_host(name: str, path: Path | None = None) -> bool:
+    """True if a 'Host <name>' block exists (exact token match, ssh
+    semantics — wildcard patterns do not count; see wildcard_shadows)."""
+    return find_config_line(name, path) is not None
+
+
+def wildcard_shadows(name: str, path: Path | None = None) -> list:
+    """Host patterns in the ssh config (or `path`) that glob-match `name`
+    but are not the exact name — e.g. 'Host *' or 'Host web*'.
+
+    New blocks are appended at the end of the file and ssh is
+    first-match-wins, so any such pattern can shadow the block's
+    User/Port/IdentityFile. The caller shows a warning when this is
+    non-empty."""
+    lines = _read_config_lines(path or SSH_CONFIG)
+    if lines is None:
+        return []
+    out = []
+    for raw in lines:
+        parts = raw.split(None, 1)
+        if len(parts) < 2 or parts[0].lower() != "host":
+            continue
+        for pat in parts[1].split():
+            if pat != name and fnmatch.fnmatchcase(name, pat) and pat not in out:
+                out.append(pat)
+    return out
+
+
+def append_host_to_config(spec: NewHost, path: Path | None = None,
+                          when: str | None = None) -> Path:
+    """Append spec's block to the ssh config (or `path`), backing the file
+    up to <config>.bak first (mandatory).
+
+    Append-only: ssh is first-match-wins, so earlier blocks keep precedence
+    and existing content is never rewritten. Raises ValueError when a
+    same-name block already exists (ambiguous config — the caller should
+    have refused via config_has_host). The write is atomic (tmp +
+    os.replace); an existing file keeps its mode, a new one is created
+    0600."""
+    path = path or SSH_CONFIG
+    if config_has_host(spec.block_name, path):
+        raise ValueError(f"Host '{spec.block_name}' already in {path}")
+    backup_ssh_config(path)
+    try:
+        base = path.read_text()
+    except OSError:
+        base = ""
+    if base and not base.endswith("\n"):
+        base += "\n"
+    if base:
+        base += "\n"  # one blank line between the old config and the block
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(base + render_config_block(spec, when))
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    os.replace(tmp, path)
+    os.chmod(path, mode)
+    return path
 
 
 # ------------------------------------------------------------------- TUI
@@ -940,17 +1225,18 @@ def _tui():
     """Import textual and define the TUI classes (once); returns SSHWiz."""
     global _TUI, hints_text, OPTIONS_HINTS, help_text, sync_help_text
     global HelpScreen, ConfirmScreen, HostList, FileList, FileSyncScreen
-    global OptionsPanel, CmdLine, SSHWiz
+    global AddHostScreen, OptionsPanel, CmdLine, SSHWiz
     global events, App, ComposeResult, SuspendNotSupported, ModalScreen
-    global Screen, Widget, Container, Vertical, ProgressBar, Static
+    global Screen, Widget, Container, Horizontal, Vertical, ProgressBar, \
+        Static, Button, Input, Select
     if _TUI:
         return SSHWiz
     from textual import events
     from textual.app import App, ComposeResult, SuspendNotSupported
-    from textual.containers import Container, Vertical
+    from textual.containers import Container, Horizontal, Vertical
     from textual.screen import ModalScreen, Screen
     from textual.widget import Widget
-    from textual.widgets import ProgressBar, Static
+    from textual.widgets import Button, Input, ProgressBar, Select, Static
 
     def hints_text() -> str:
         """Bottom-bar key hints; ^t is only shown when tmux is installed."""
@@ -958,8 +1244,8 @@ def _tui():
                  "^f: fav", "^o: opts"]
         if tmux_available():
             parts.append("^t: tmux")
-        parts += ["^y: copy", "^s: sync", "^e: edit", "^g: cats",
-                  "esc: clear", "^q: quit"]
+        parts += ["^y: copy", "^s: sync", "^a: add", "^e: edit",
+                  "^g: cats", "esc: clear", "^q: quit"]
         return "    ".join(parts)
 
 
@@ -983,6 +1269,7 @@ def _tui():
         lines += [
             "  ^y          copy the ssh command for the selected host",
             "  ^s          file-sync screen (twin-panel local -> remote)",
+            "  ^a          add host (wizard: key + ssh-copy-id + config)",
             "  ^e          open ~/.ssh/config at the selected host",
             "  ^g          open categories file, then refresh",
             "  ^h          (terminals send backspace for ^h, so use ? / F1)",
@@ -1930,6 +2217,360 @@ def _tui():
                 event.stop()
 
 
+    class AddHostScreen(Screen):
+        """Host onboarding wizard: a form (host, port, user, optional alias,
+        key), then staged execution:
+
+          validate + collision guard -> key (pick or generate per-host)
+          -> ssh-copy-id (password on the handed-over terminal)
+          -> BatchMode probe (no config write on failure, unless confirmed)
+          -> backup + append to ~/.ssh/config -> picker refresh
+
+        Any failure keeps the screen open with the form intact (retry in
+        place); esc/q cancels without touching anything. Only esc/q are
+        stopped here — every other key bubbles to the App, where focused
+        Input and Screen bindings (backspace, arrows, tab navigation,
+        enter) are checked. Demo mode: the config write is real (the demo's
+        temp config), copy-id/probe/keygen are shown, not run."""
+        CSS = """
+        AddHostScreen {
+            align: center middle;
+        }
+        #add-root {
+            width: 76;
+            height: auto;
+            border: heavy $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        #add-title {
+            text-style: bold;
+        }
+        .add-row {
+            height: auto;
+        }
+        .add-label {
+            width: 8;
+            color: $text-muted;
+        }
+        .add-hint {
+            width: 12;
+            color: $text-muted;
+        }
+        .add-row Input {
+            width: 1fr;
+            height: 1;
+            border: none;
+            padding: 0 1;
+        }
+        .add-row Input.-invalid {
+            background-tint: $error 20%;
+        }
+        #add-key {
+            width: 100%;
+            margin-top: 1;
+        }
+        #add-preview {
+            height: auto;
+            max-height: 9;
+            margin-top: 1;
+            border-top: heavy $border;
+            padding-top: 1;
+        }
+        #add-btn {
+            margin-top: 1;
+        }
+        #add-status {
+            height: auto;
+            min-height: 1;
+            max-height: 4;
+            margin-top: 1;
+        }
+        """
+
+        def __init__(self, keys_dir: Path | None = None) -> None:
+            super().__init__()
+            self.keys_dir = keys_dir
+            self.busy = False
+
+        def compose(self) -> ComposeResult:
+            with Container(id="add-root"):
+                yield Static(" add host — key auth + ~/.ssh/config",
+                             id="add-title")
+                with Horizontal(classes="add-row"):
+                    yield Static("host", classes="add-label")
+                    yield Input(placeholder="name or IP", id="add-host")
+                with Horizontal(classes="add-row"):
+                    yield Static("port", classes="add-label")
+                    yield Input(value="22", id="add-port", restrict=r"[0-9]*")
+                with Horizontal(classes="add-row"):
+                    yield Static("user", classes="add-label")
+                    yield Input(value=_default_user(), id="add-user")
+                with Horizontal(classes="add-row"):
+                    yield Static("name", classes="add-label")
+                    yield Input(placeholder="optional alias (default: host)",
+                                id="add-name")
+                opts = self._key_options()
+                yield Select(opts, prompt="key", value=opts[0][1],
+                             id="add-key", compact=True, allow_blank=False)
+                yield Static("", id="add-preview")
+                with Horizontal(id="add-actions"):
+                    yield Button("Add host", variant="primary", id="add-btn",
+                                 compact=True)
+                    yield Static(" esc: cancel", classes="add-hint")
+                yield Static("", id="add-status")
+
+        def on_mount(self) -> None:
+            self._refresh_preview()
+            self._refresh_field_validation()
+            self.query_one("#add-host", Input).focus()
+
+        # -- form
+
+        def _key_options(self) -> list:
+            """[(label, key path)] — existing keypairs, then the 'generate
+            new' entry (empty path = generate a per-host key)."""
+            opts = []
+            for k in find_ssh_keys(self.keys_dir):
+                label = f"{k.name} · {k.type}"
+                if k.comment:
+                    label += f" · {k.comment}"
+                opts.append((label, str(k.path)))
+            opts.append(("generate new (per-host ed25519)", ""))
+            return opts
+
+        def on_select_changed(self, _event: Select.Changed) -> None:
+            self._refresh_preview()
+
+        def _input(self, wid: str) -> str:
+            return self.query_one(wid, Input).value.strip()
+
+        def _spec(self) -> NewHost:
+            v = self.query_one("#add-key", Select).value
+            return NewHost(
+                host=self._input("#add-host"),
+                user=self._input("#add-user") or _default_user(),
+                port=self._input("#add-port") or "22",
+                name=self._input("#add-name"),
+                key=v if isinstance(v, str) else "")
+
+        def _refresh_preview(self) -> None:
+            spec = self._spec()
+            t = Text(end="")
+            if not spec.host:
+                t.append("fill in the host to preview the config block",
+                         style="dim")
+            else:
+                t.append("will append to ", style="dim")
+                t.append(str(SSH_CONFIG), style="bold")
+                t.append(" (backed up to .bak first):\n", style="dim")
+                t.append(render_config_block(spec), style="grey82")
+                t.append(f"then connect with:  ssh {spec.block_name}\n",
+                         style="bold")
+                for pat in wildcard_shadows(spec.block_name):
+                    t.append(f"warning: 'Host {pat}' earlier in the file "
+                             f"may shadow this block (ssh first-match-"
+                             f"wins)\n", style="yellow")
+            self.query_one("#add-preview", Static).update(t)
+
+        def _refresh_field_validation(self) -> None:
+            """Live per-field feedback: mark host/port -invalid while they
+            hold a value that could never be a usable ssh target. Empty is
+            left unmarked (checked on submit, where a default may apply)."""
+            host = self.query_one("#add-host", Input)
+            port = self.query_one("#add-port", Input)
+            hv = host.value.strip()
+            host.set_class(bool(hv) and not valid_host(hv), "-invalid")
+            pv = port.value.strip()
+            port.set_class(bool(pv) and not valid_port(pv), "-invalid")
+
+        def _update_status(self, text: str, style: str = "") -> None:
+            self.query_one("#add-status", Static).update(
+                Text(f" {text}", style=style))
+
+        def _validate(self) -> str | None:
+            s = self._spec()
+            if not s.host:
+                return "host is required"
+            if not valid_host(s.host):
+                return f"host {s.host!r} is not a valid hostname or IP"
+            if not valid_port(s.port):
+                return f"port must be a number 1-65535 (got {s.port!r})"
+            if not s.user:
+                return "user is required"
+            if s.name and not re.fullmatch(r"[A-Za-z0-9._-]+", s.name):
+                return "name may only use letters, digits, . _ -"
+            return None
+
+        # -- execution
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "add-btn" and not self.busy:
+                self.app.run_worker(self._run_wizard())
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            self._refresh_field_validation()
+            self._refresh_preview()
+
+        def on_key(self, event: events.Key) -> None:
+            """esc/q cancel. Everything else is left to the focused widget
+            (Input editing) and the Screen bindings (tab navigation);
+            keys that still bubble on are ignored by the App while this
+            overlay is active, so the background host list is untouched."""
+            if event.key in ("escape", "q") and not self.busy:
+                self.app.pop_screen()
+                event.stop()
+
+        def on_input_submitted(self, _event: Input.Submitted) -> None:
+            """Enter in a field starts the add (same as the Add button)."""
+            if not self.busy:
+                self.app.run_worker(self._run_wizard())
+
+        async def _confirm(self, message: str) -> bool:
+            return bool(await self.app.push_screen(
+                ConfirmScreen(message), wait_for_dismiss=True))
+
+        def _run_probe(self, spec: NewHost) -> tuple:
+            """(rc, stderr) of the BatchMode probe, off the UI thread."""
+            proc = subprocess.run(build_probe_cmd(spec), capture_output=True,
+                                  text=True, check=False,
+                                  env={**os.environ, "LC_ALL": "C"})
+            return proc.returncode, proc.stderr
+
+        def _run_copyid(self, spec: NewHost) -> int:
+            """ssh-copy-id exit code, off the UI thread (output goes to the
+            terminal during the suspend handover)."""
+            return subprocess.run(build_copyid_cmd(spec),
+                                  check=False).returncode
+
+        async def _run_wizard(self) -> None:
+            self.busy = True
+            try:
+                await self._wizard()
+            finally:
+                self.busy = False
+
+        async def _wizard(self) -> None:
+            err = self._validate()
+            if err:
+                self._update_status("✗ " + err, "bold red")
+                return
+            spec = self._spec()
+            if config_has_host(spec.block_name):
+                self._update_status(
+                    f"✗ host '{spec.block_name}' already in {SSH_CONFIG} — "
+                    f"edit it there (^e) or pick another name", "bold red")
+                return
+            if not await self._stage_key(spec):
+                return
+            if not self.is_mounted:
+                return
+            if not await self._stage_copyid(spec):
+                return
+            if not self.is_mounted:
+                return
+            if not await self._stage_probe(spec):
+                return
+            if not self.is_mounted:
+                return
+            self._stage_write(spec)
+
+        async def _stage_key(self, spec: NewHost) -> bool:
+            """Resolve spec.key: an existing selection, or a generated
+            per-host key (reuse with consent when it already exists).
+            Returns False when the wizard should stop."""
+            if spec.key:
+                return True
+            kd = self.keys_dir or (Path.home() / ".ssh")
+            gen_path = kd / sanitize_key_name(spec.host)
+            if gen_path.exists() or (kd / (gen_path.name + ".pub")).exists():
+                answer = await self._confirm(
+                    f"key already exists:\n  {gen_path}\n\n"
+                    f"reuse it (instead of generating)?")
+                if not answer or not self.is_mounted:
+                    return False
+                spec.key = str(gen_path)
+                return True
+            if DEMO:
+                spec.key = str(gen_path)
+                self._update_status(f"demo — would generate {gen_path}")
+                return True
+            self._update_status("generating key…")
+            try:
+                spec.key = str(await asyncio.to_thread(
+                    generate_key, spec.host, spec.user, self.keys_dir))
+            except (FileExistsError, RuntimeError) as ex:
+                self._update_status("✗ " + str(ex), "bold red")
+                return False
+            self._refresh_preview()
+            return True
+
+        async def _stage_copyid(self, spec: NewHost) -> bool:
+            cmd = build_copyid_cmd(spec)
+            if DEMO:
+                self.app.notify(f"demo — would run: {' '.join(cmd)}",
+                                title="add host")
+                return True
+            self._update_status(
+                "⏳ ssh-copy-id — enter the password in the terminal…")
+            try:
+                with self.app.suspend():
+                    rc = await asyncio.to_thread(self._run_copyid, spec)
+            except SuspendNotSupported:
+                self.app.notify("terminal does not support suspend — run: "
+                                + " ".join(cmd), severity="error")
+                return False
+            if not self.is_mounted:
+                return False
+            if rc != 0:
+                self._update_status(
+                    f"✗ ssh-copy-id failed (exit {rc}) — check the output "
+                    f"above, fix and press Add again", "bold red")
+                return False
+            return True
+
+        async def _stage_probe(self, spec: NewHost) -> bool:
+            if DEMO:
+                self.app.notify(
+                    f"demo — would run: {' '.join(build_probe_cmd(spec))}",
+                    title="add host")
+                self._update_status("✓ demo — assuming key auth works")
+                return True
+            self._update_status("⏳ verifying key auth (BatchMode probe)…")
+            rc, err = await asyncio.to_thread(self._run_probe, spec)
+            if not self.is_mounted:
+                return False
+            state = classify_probe(rc, err)
+            if state == "ok":
+                self._update_status("✓ key auth works")
+                return True
+            what = ("the host refused key auth" if state == "nokey"
+                    else "the host is unreachable")
+            answer = await self._confirm(
+                f"⚠ {what}\n\nwrite the config anyway?")
+            if not answer or not self.is_mounted:
+                self._update_status("aborted — config not written",
+                                    "bold yellow")
+                return False
+            return True
+
+        def _stage_write(self, spec: NewHost) -> None:
+            self._update_status("writing config…")
+            try:
+                append_host_to_config(spec)
+            except ValueError as ex:  # race: the block appeared meanwhile
+                self._update_status("✗ " + str(ex), "bold red")
+                return
+            except OSError as ex:
+                self._update_status(f"✗ could not write {SSH_CONFIG}: {ex}",
+                                    "bold red")
+                return
+            self.app.reload()
+            self.app.notify(
+                f"✓ added {spec.block_name} — key installed, connect "
+                f"with: ssh {spec.block_name}", title="add host")
+            self.app.pop_screen()
+
     class OptionsPanel(Widget):
         """The ^o panel: one row per ssh option. ↑↓ selects, ←/→/⏎ cycles the
         selected option's value (off → v1 → … → off). Keys are handled by the
@@ -2222,6 +2863,11 @@ def _tui():
                 return
             self.push_screen(FileSyncScreen(hl.shown[hl.cursor]))
 
+        def open_add_host(self) -> None:
+            """Open the host onboarding wizard (Ctrl+A): a form, then
+            key gen -> ssh-copy-id -> verify -> backup + config append."""
+            self.push_screen(AddHostScreen())
+
         # -- options panel (^o)
 
         def enabled_options(self) -> list:
@@ -2338,12 +2984,22 @@ def _tui():
         # -- keys
 
         def on_key(self, event: events.Key) -> None:
-            hl = self.query_one(HostList)
             key = event.key
             if key in ("ctrl+c", "ctrl+q"):
                 self.exit()
                 event.stop()
-            elif key in ("ctrl+h", "question_mark", "f1"):
+                return
+            # While an overlay screen (help / confirm / add-host /
+            # file-sync) is active it owns the keyboard: its on_key and
+            # the focused widget handle the key. Any key that still leaks
+            # here must NOT mutate the background host list. (Add new
+            # overlay screens to this tuple.)
+            if any(isinstance(s, (HelpScreen, ConfirmScreen, AddHostScreen,
+                                  FileSyncScreen))
+                   for s in self.screen_stack):
+                return
+            hl = self.query_one(HostList)
+            if key in ("ctrl+h", "question_mark", "f1"):
                 self.toggle_help()
                 event.stop()
             elif self.options_open:
@@ -2435,6 +3091,9 @@ def _tui():
                 event.stop()
             elif key == "ctrl+s":
                 self.open_file_sync()
+                event.stop()
+            elif key == "ctrl+a":
+                self.open_add_host()
                 event.stop()
             elif event.is_printable:
                 hl.filter += event.character

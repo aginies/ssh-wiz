@@ -7,6 +7,7 @@ import importlib.util
 import io
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2060,6 +2061,829 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertNotIsInstance(app.screen, shw.FileSyncScreen)
                 self.assertTrue(stall._killed.is_set())
+
+
+class NewHostSpecTest(unittest.TestCase):
+    def test_block_name_defaults_to_host(self):
+        s = shw.NewHost(host="web1.example.com", user="alice")
+        self.assertEqual(s.block_name, "web1.example.com")
+        self.assertEqual(s.target, "alice@web1.example.com")
+
+    def test_block_name_uses_alias(self):
+        s = shw.NewHost(host="10.0.0.5", user="bob", name="db")
+        self.assertEqual(s.block_name, "db")
+        self.assertEqual(s.target, "bob@10.0.0.5")
+
+    def test_valid_port(self):
+        for ok in ("22", "2222", "65535"):
+            self.assertTrue(shw.valid_port(ok), ok)
+        for bad in ("", "0", "65536", "abc", "22x", "-1", "1.5"):
+            self.assertFalse(shw.valid_port(bad), bad)
+
+    def test_valid_host(self):
+        for ok in (
+            "ryzen9",
+            "web1.example.com",
+            "my_host",
+            "a",
+            "1234",
+            "10.0.1.5",
+            "192.168.1.1",
+            "fe80::1",
+            "2001:db8::42",
+        ):
+            self.assertTrue(shw.valid_host(ok), ok)
+        for bad in (
+            "",
+            "   ",
+            "web 1",
+            "host!",
+            "a..b",
+            ".hidden",
+            "999.1.1.1",
+            "300.300.300.300",
+            "a" * 254,
+            "-lead",
+            "trail-",
+        ):
+            self.assertFalse(shw.valid_host(bad), bad)
+
+
+class BuildCopyidCmdTest(unittest.TestCase):
+    def spec(self, **kw):
+        base = {
+            "host": "web1.example.com",
+            "user": "alice",
+            "key": "/home/u/.ssh/id_ed25519",
+        }
+        base.update(kw)
+        return shw.NewHost(**base)
+
+    def test_default_port_no_p(self):
+        self.assertEqual(
+            shw.build_copyid_cmd(self.spec()),
+            ["ssh-copy-id", "-i", "/home/u/.ssh/id_ed25519", "alice@web1.example.com"],
+        )
+
+    def test_nondefault_port(self):
+        self.assertEqual(
+            shw.build_copyid_cmd(self.spec(port="2222")),
+            [
+                "ssh-copy-id",
+                "-i",
+                "/home/u/.ssh/id_ed25519",
+                "-p",
+                "2222",
+                "alice@web1.example.com",
+            ],
+        )
+
+    def test_no_force_flag(self):
+        # re-runs are idempotent: an existing key is reported, not duplicated
+        self.assertNotIn("-f", shw.build_copyid_cmd(self.spec()))
+
+
+class BuildProbeCmdTest(unittest.TestCase):
+    def spec(self, **kw):
+        base = {
+            "host": "web1.example.com",
+            "user": "alice",
+            "key": "/home/u/.ssh/id_ed25519",
+        }
+        base.update(kw)
+        return shw.NewHost(**base)
+
+    def test_shape(self):
+        cmd = shw.build_probe_cmd(self.spec())
+        self.assertEqual(cmd[0], "ssh")
+        self.assertIn("BatchMode=yes", cmd)
+        self.assertIn(f"ConnectTimeout={shw.PROBE_TIMEOUT}", cmd)
+        self.assertEqual(cmd[cmd.index("-i") + 1], "/home/u/.ssh/id_ed25519")
+        self.assertNotIn("-p", cmd)
+        self.assertEqual(cmd[-2:], ["alice@web1.example.com", "true"])
+
+    def test_nondefault_port_and_ssh_default_key(self):
+        cmd = shw.build_probe_cmd(self.spec(port="8022", key=""))
+        self.assertEqual(cmd[cmd.index("-p") + 1], "8022")
+        self.assertNotIn("-i", cmd)
+        self.assertEqual(cmd[-2:], ["alice@web1.example.com", "true"])
+
+
+class ClassifyProbeTest(unittest.TestCase):
+    def test_ok(self):
+        self.assertEqual(shw.classify_probe(0, ""), "ok")
+        self.assertEqual(shw.classify_probe(0, "harmless noise"), "ok")
+
+    def test_nokey_on_permission_denied(self):
+        self.assertEqual(
+            shw.classify_probe(255, "Permission denied (publickey,password)."), "nokey"
+        )
+
+    def test_down_variants(self):
+        for err in (
+            ("ssh: connect to host web1 port 22: Connection timed out"),
+            ("ssh: connect to host web1 port 22: Connection refused"),
+            ("ssh: Could not resolve hostname web1: Name or service not known"),
+            ("kex_exchange_identification: Connection reset by peer"),
+        ):
+            self.assertEqual(shw.classify_probe(255, err), "down", err)
+        self.assertEqual(shw.classify_probe(1, "some other failure"), "down")
+
+
+class SshKeyDiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+
+    def write_pub(self, name, key_type, comment=""):
+        (self.d / (name + ".pub")).write_text(
+            f"{key_type} AAAAC3Nz{(' ' + comment) if comment else ''}\n"
+        )
+
+    def test_finds_pairs_sorted(self):
+        (self.d / "id_ed25519").write_text("priv")
+        self.write_pub("id_ed25519", "ssh-ed25519", "antoine@laptop")
+        (self.d / "id_rsa").write_text("priv")
+        self.write_pub("id_rsa", "ssh-rsa")  # no comment
+        keys = shw.find_ssh_keys(self.d)
+        self.assertEqual([k.name for k in keys], ["id_ed25519", "id_rsa"])
+        self.assertEqual(keys[0].type, "ssh-ed25519")
+        self.assertEqual(keys[0].comment, "antoine@laptop")
+        self.assertEqual(keys[1].comment, "")
+        self.assertEqual(keys[0].path, self.d / "id_ed25519")
+
+    def test_skips_incomplete_and_unrelated(self):
+        (self.d / "id_ecdsa").write_text("priv")  # no .pub
+        (self.d / "id_orphan.pub").write_text("ssh-rsa X")  # no private key
+        (self.d / "id_dir").mkdir()  # not a file
+        (self.d / "notes.txt").write_text("hello")
+        (self.d / "id_bad").write_text("priv")
+        (self.d / "id_bad.pub").write_text("ssh-rsa\n")  # malformed .pub
+        self.assertEqual(shw.find_ssh_keys(self.d), [])
+
+    def test_missing_dir(self):
+        self.assertEqual(shw.find_ssh_keys(self.d / "nope"), [])
+
+
+class SanitizeKeyNameTest(unittest.TestCase):
+    def test_hostname_keeps_dots(self):
+        self.assertEqual(
+            shw.sanitize_key_name("web1.example.com"), "id_ed25519_web1.example.com"
+        )
+
+    def test_ipv6(self):
+        self.assertEqual(shw.sanitize_key_name("2001:db8::1"), "id_ed25519_2001-db8-1")
+
+    def test_special_chars(self):
+        self.assertEqual(shw.sanitize_key_name("a b/c"), "id_ed25519_a-b-c")
+
+    def test_nothing_usable(self):
+        self.assertEqual(shw.sanitize_key_name(":::"), "id_ed25519_host")
+
+    def test_leading_dot_stripped(self):
+        self.assertEqual(shw.sanitize_key_name(".hidden"), "id_ed25519_hidden")
+
+
+class GenerateKeyTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+
+    def test_existing_key_raises_before_keygen(self):
+        (self.d / "id_ed25519_web1").write_text("priv")
+        with (
+            mock.patch.object(shw.subprocess, "run") as run,
+            self.assertRaises(FileExistsError),
+        ):
+            shw.generate_key("web1", "alice", self.d)
+        run.assert_not_called()  # never overwrites an existing key
+
+    def test_existing_pub_also_raises(self):
+        (self.d / "id_ed25519_web1.pub").write_text("ssh-ed25519 X")
+        with self.assertRaises(FileExistsError):
+            shw.generate_key("web1", "alice", self.d)
+
+    def test_command_and_result(self):
+        path = self.d / "id_ed25519_web1"
+        proc = mock.Mock(returncode=0, stderr="")
+        with mock.patch.object(shw.subprocess, "run", return_value=proc) as run:
+            out = shw.generate_key("web1", "alice", self.d)
+        self.assertEqual(out, path)
+        run.assert_called_once_with(
+            [
+                "ssh-keygen",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "alice@web1",
+                "-f",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_keygen_failure_raises(self):
+        proc = mock.Mock(returncode=255, stderr="boom\n")
+        with (
+            mock.patch.object(shw.subprocess, "run", return_value=proc) as _run,
+            self.assertRaises(RuntimeError) as cm,
+        ):
+            shw.generate_key("web1", "alice", self.d)
+        self.assertIn("boom", str(cm.exception))
+
+    def test_keygen_missing_raises(self):
+        with (
+            mock.patch.object(shw.subprocess, "run", side_effect=FileNotFoundError),
+            self.assertRaises(RuntimeError),
+        ):
+            shw.generate_key("web1", "alice", self.d)
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen not installed")
+    def test_real_keygen(self):
+        out = shw.generate_key("web1.example.com", "alice", self.d)
+        self.assertTrue(out.is_file())
+        pub = out.with_name(out.name + ".pub")
+        self.assertTrue(pub.is_file())
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+        fields = pub.read_text().split()
+        self.assertEqual(fields[0], "ssh-ed25519")
+        self.assertEqual(fields[2], "alice@web1.example.com")
+
+
+class RenderConfigBlockTest(unittest.TestCase):
+    def spec(self, **kw):
+        base = {
+            "host": "web1.example.com",
+            "user": "alice",
+            "key": "/home/u/.ssh/id_ed25519",
+        }
+        base.update(kw)
+        return shw.NewHost(**base)
+
+    def test_minimal(self):
+        # name == host and port 22: no HostName, no Port
+        self.assertEqual(
+            shw.render_config_block(self.spec(), when="2026-01-02"),
+            "# added by ssh-wiz on 2026-01-02\n"
+            "Host web1.example.com\n"
+            "    User alice\n"
+            "    IdentityFile /home/u/.ssh/id_ed25519\n",
+        )
+
+    def test_alias_and_port(self):
+        text = shw.render_config_block(
+            self.spec(name="web", port="2222"), when="2026-01-02"
+        )
+        self.assertIn("Host web\n", text)
+        self.assertIn("    HostName web1.example.com\n", text)
+        self.assertIn("    Port 2222\n", text)
+        self.assertIn("    User alice\n", text)
+
+    def test_no_key_omits_identityfile(self):
+        self.assertNotIn(
+            "IdentityFile", shw.render_config_block(self.spec(key=""), when="x")
+        )
+
+
+class BackupSshConfigTest(TempPathsTestCase):
+    def test_no_config_no_backup(self):
+        self.assertIsNone(shw.backup_ssh_config())
+
+    def test_backup_contents_and_mode(self):
+        self.ssh_config.write_text("Host old\n    User bob\n")
+        bak = shw.backup_ssh_config()
+        self.assertEqual(bak, self.ssh_config.with_name("ssh_config.bak"))
+        self.assertEqual(bak.read_text(), "Host old\n    User bob\n")
+        self.assertEqual(stat.S_IMODE(bak.stat().st_mode), 0o600)
+
+
+class AppendHostToConfigTest(TempPathsTestCase):
+    def spec(self, **kw):
+        base = {
+            "host": "web1.example.com",
+            "user": "alice",
+            "key": "/home/u/.ssh/id_ed25519",
+        }
+        base.update(kw)
+        return shw.NewHost(**base)
+
+    def test_creates_config_0600_no_backup(self):
+        shw.append_host_to_config(self.spec(), when="2026-01-02")
+        self.assertIn("Host web1.example.com", self.ssh_config.read_text())
+        self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o600)
+        self.assertFalse(self.ssh_config.with_name("ssh_config.bak").exists())
+
+    def test_backup_is_previous_state(self):
+        self.ssh_config.write_text("Host old\n    User bob\n")
+        shw.append_host_to_config(self.spec(), when="2026-01-02")
+        bak = self.ssh_config.with_name("ssh_config.bak")
+        self.assertEqual(bak.read_text(), "Host old\n    User bob\n")
+        self.assertEqual(stat.S_IMODE(bak.stat().st_mode), 0o600)
+        # old block, one blank line, then the new block
+        self.assertEqual(
+            self.ssh_config.read_text(),
+            "Host old\n    User bob\n\n"
+            "# added by ssh-wiz on 2026-01-02\n"
+            "Host web1.example.com\n"
+            "    User alice\n"
+            "    IdentityFile /home/u/.ssh/id_ed25519\n",
+        )
+
+    def test_existing_mode_preserved(self):
+        self.ssh_config.write_text("Host old\n")
+        os.chmod(self.ssh_config, 0o644)
+        shw.append_host_to_config(self.spec(), when="x")
+        self.assertEqual(stat.S_IMODE(self.ssh_config.stat().st_mode), 0o644)
+
+    def test_no_trailing_newline_fixed(self):
+        self.ssh_config.write_text("Host old\n    User bob")  # no final \n
+        shw.append_host_to_config(self.spec(), when="x")
+        self.assertIn("User bob\n\n# added by ssh-wiz", self.ssh_config.read_text())
+
+    def test_second_write_refreshes_backup(self):
+        self.ssh_config.write_text("Host a\n    User x\n")
+        shw.append_host_to_config(self.spec(name="w1"), when="x")
+        shw.append_host_to_config(self.spec(name="w2"), when="x")
+        bak = self.ssh_config.with_name("ssh_config.bak")
+        # the .bak holds the state after the first write, not the original
+        self.assertIn("Host w1", bak.read_text())
+        self.assertNotIn("Host w2", bak.read_text())
+
+    def test_collision_refused_before_any_write(self):
+        self.ssh_config.write_text("Host web1.example.com\n    User bob\n")
+        with self.assertRaises(ValueError):
+            shw.append_host_to_config(self.spec(), when="x")
+        self.assertEqual(
+            self.ssh_config.read_text(), "Host web1.example.com\n    User bob\n"
+        )
+        self.assertFalse(self.ssh_config.with_name("ssh_config.bak").exists())
+
+
+class ConfigCollisionAndShadowTest(TempPathsTestCase):
+    def test_config_has_host_exact(self):
+        self.ssh_config.write_text(
+            "Host web1 web1-alias\n    User a\nHost other\n    User b\n"
+        )
+        self.assertTrue(shw.config_has_host("web1"))
+        self.assertTrue(shw.config_has_host("web1-alias"))
+        self.assertFalse(shw.config_has_host("web"))
+        self.assertFalse(shw.config_has_host("other-x"))
+
+    def test_config_has_host_missing_file(self):
+        self.assertFalse(shw.config_has_host("web1"))
+
+    def test_wildcards_do_not_count_as_collision(self):
+        self.ssh_config.write_text("Host *\n    User wildcard\n")
+        self.assertFalse(shw.config_has_host("web1"))
+
+    def test_wildcard_shadows(self):
+        self.ssh_config.write_text(
+            "Host *\n    User a\n"
+            "Host web*\n    User b\n"
+            "Host web1\n    User c\n"
+            "Host db1\n    User d\n"
+        )
+        self.assertEqual(shw.wildcard_shadows("web1"), ["*", "web*"])
+        self.assertEqual(shw.wildcard_shadows("db1"), ["*"])
+        self.assertEqual(shw.wildcard_shadows("other"), ["*"])
+
+    def test_wildcard_shadows_missing_file(self):
+        self.assertEqual(shw.wildcard_shadows("web1"), [])
+
+    def test_find_config_line_path_param(self):
+        other = self.ssh_config.with_name("other_config")
+        other.write_text("Host zed\n    User z\n")
+        self.ssh_config.write_text("Host alpha\n    User a\n")
+        self.assertEqual(shw.find_config_line("zed", other), 1)
+        self.assertIsNone(shw.find_config_line("zed"))
+
+
+class AddHostTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
+    """Pilot tests for the ^a host onboarding wizard (AddHostScreen)."""
+
+    def make_keys(self, *names):
+        """A temp key dir holding fake keypairs named after `names`."""
+        d = Path(tempfile.mkdtemp(prefix="ssh-wiz-wizkeys-"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        for n in names:
+            (d / n).write_text("fake private key")
+            (d / (n + ".pub")).write_text(f"ssh-ed25519 AAAA wiz@laptop {n}\n")
+        return d
+
+    def push_wizard(self, app, keys):
+        app.push_screen(shw.AddHostScreen(keys))
+
+    @staticmethod
+    def fill(app, host="web1.example.com", port="22", user=None, name=""):
+        scr = app.screen
+        scr.query_one("#add-host", shw.Input).value = host
+        scr.query_one("#add-port", shw.Input).value = port
+        if user is not None:
+            scr.query_one("#add-user", shw.Input).value = user
+        scr.query_one("#add-name", shw.Input).value = name
+
+    @staticmethod
+    def status_of(app):
+        scr = app.screen
+        if not isinstance(scr, shw.AddHostScreen):
+            return ""
+        return str(scr.query_one("#add-status", shw.Static).render())
+
+    @staticmethod
+    async def wait_until(pilot, pred, tries=100):
+        for _ in range(tries):
+            if pred():
+                return
+            await pilot.pause()
+
+    def suspend_stub(self):
+        return mock.patch.object(
+            shw.SSHWiz, "suspend", new=lambda self: contextlib.nullcontext()
+        )
+
+    async def test_ctrl_a_opens_and_esc_cancels(self):
+        app = shw.SSHWiz()
+        with mock.patch.object(shw, "find_ssh_keys", return_value=[]):
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.press("ctrl+a")
+                self.assertIsInstance(app.screen, shw.AddHostScreen)
+                await pilot.press("escape")
+                self.assertNotIsInstance(app.screen, shw.AddHostScreen)
+
+    async def test_backspace_and_tab_navigate(self):
+        """Regression: keys must reach the focused Input's bindings
+        (backspace) and the Screen's bindings (tab / shift+tab)."""
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            host = app.screen.query_one("#add-host", shw.Input)
+            port = app.screen.query_one("#add-port", shw.Input)
+            user = app.screen.query_one("#add-user", shw.Input)
+            self.assertIs(app.focused, host)
+            await pilot.press("h", "e", "l", "l", "o")
+            await pilot.pause()
+            self.assertEqual(host.value, "hello")
+            await pilot.press("backspace", "backspace")
+            await pilot.pause()
+            self.assertEqual(host.value, "hel")
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertIs(app.focused, port)
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertIs(app.focused, user)
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            self.assertIs(app.focused, port)
+
+    async def test_keys_do_not_leak_to_background(self):
+        """Regression: while the wizard is open, keys must not mutate the
+        background host list (cursor/filter) or switch its category tab —
+        they used to bubble to the App's catch-all on_key and drive the
+        background list. Tab navigation inside the wizard must still work."""
+        self.ssh_config.write_text("Host alpha\n  User alice\nHost beta\n  User bob\n")
+        self.categories.write_text("LAN  alpha\nWORK  beta\n")
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            hl = app.query_one(shw.HostList)
+            self.assertEqual(hl.cursor, 0)
+            self.assertEqual(hl.filter, "")
+            self.assertEqual(app.current_cat, shw.ALL_CATEGORY)
+            host = app.screen.query_one("#add-host", shw.Input)
+            port = app.screen.query_one("#add-port", shw.Input)
+            self.assertIs(app.focused, host)
+            # need >1 host so a leaked down/end/pagedown would move the cursor
+            self.assertGreater(len(hl.shown), 1)
+            # list-navigation keys: must not scroll the background list
+            for key in ("down", "end", "pagedown"):
+                await pilot.press(key)
+                await pilot.pause()
+                self.assertEqual(hl.cursor, 0, f"{key} moved the bg cursor")
+            self.assertEqual(hl.filter, "")
+            self.assertEqual(app.current_cat, shw.ALL_CATEGORY)
+            self.assertIs(app.focused, host)
+            # category keys: must not switch the background tab
+            for key in ("right", "left"):
+                await pilot.press(key)
+                await pilot.pause()
+                self.assertEqual(
+                    app.current_cat, shw.ALL_CATEGORY, f"{key} switched the bg category"
+                )
+            self.assertIs(app.focused, host)
+            # tab navigation inside the wizard still works
+            await pilot.press("tab")
+            await pilot.pause()
+            self.assertIs(app.focused, port)
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            self.assertIs(app.focused, host)
+
+    async def test_enter_starts_add(self):
+        """Enter in a field starts the add (here: validation feedback)."""
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            await pilot.press("enter")
+            await self.wait_until(
+                pilot, lambda: "required" in self.status_of(app).lower()
+            )
+            self.assertIsInstance(app.screen, shw.AddHostScreen)
+
+    async def test_preview_and_key_select(self):
+        """Key picker: Select dropdown; picking an option updates the
+        preview, and the chosen key is what the wizard uses."""
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            user = app.screen.query_one("#add-user", shw.Input).value
+            self.fill(app, host="web1.example.com", name="web")
+            await pilot.pause()
+            preview = str(app.screen.query_one("#add-preview", shw.Static).render())
+            self.assertIn("Host web", preview)
+            self.assertIn("HostName web1.example.com", preview)
+            self.assertIn(f"User {user}", preview)
+            self.assertIn("IdentityFile", preview)
+            self.assertIn("then connect with:  ssh web", preview)
+            sel = app.screen.query_one("#add-key", shw.Select)
+            self.assertTrue(sel.value.endswith("id_ed25519"))
+            # open the dropdown (click) and pick 'generate new' with the
+            # keyboard: the cursor starts on the current value, so one
+            # 'down' reaches the last option with a single key available
+            await pilot.click("#add-key")
+            await pilot.pause()
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            self.assertEqual(sel.value, "")
+            # picking 'generate new' drops IdentityFile from the preview
+            preview = str(app.screen.query_one("#add-preview", shw.Static).render())
+            self.assertNotIn("IdentityFile", preview)
+            # and back to the existing key: open, one 'up', enter
+            await pilot.click("#add-key")
+            await pilot.pause()
+            await pilot.press("up", "enter")
+            await pilot.pause()
+            self.assertTrue(sel.value.endswith("id_ed25519"))
+
+    async def test_validation_errors(self):
+        keys = self.make_keys()
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            await pilot.click("#add-btn")
+            await self.wait_until(
+                pilot, lambda: "host is required" in self.status_of(app)
+            )
+            self.assertIsInstance(app.screen, shw.AddHostScreen)
+            self.fill(app, host="web1.example.com", port="99999")
+            await pilot.pause()
+            await pilot.click("#add-btn")
+            await self.wait_until(
+                pilot, lambda: "port must be a number" in self.status_of(app)
+            )
+            self.fill(app, host="web 1")
+            await pilot.pause()
+            await pilot.click("#add-btn")
+            await self.wait_until(
+                pilot, lambda: "not a valid hostname or IP" in self.status_of(app)
+            )
+
+    async def test_port_rejects_letters(self):
+        """The port field is digits-only: letters can't be typed or pasted."""
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            port = app.screen.query_one("#add-port", shw.Input)
+            port.value = ""
+            port.focus()
+            await pilot.pause()
+            await pilot.press("8", "0", "a", "b", "8")
+            await pilot.pause()
+            self.assertEqual(port.value, "808")  # letters dropped
+            port.insert_text_at_cursor("80x80")  # non-digit paste rejected
+            await pilot.pause()
+            self.assertEqual(port.value, "808")
+
+    async def test_host_live_validation(self):
+        """An invalid host tints the field -invalid; a valid one clears it."""
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            self.push_wizard(app, keys)
+            await pilot.pause()
+            host = app.screen.query_one("#add-host", shw.Input)
+            self.assertFalse(host.has_class("-invalid"))
+            for bad in ("web 1", "999.1.1.1", "host!"):
+                host.value = bad
+                await pilot.pause()
+                self.assertTrue(host.has_class("-invalid"), bad)
+            for good in ("web1.example.com", "10.0.1.5", "fe80::1"):
+                host.value = good
+                await pilot.pause()
+                self.assertFalse(host.has_class("-invalid"), good)
+
+    async def test_collision_refuses_without_ssh(self):
+        self.ssh_config.write_text("Host web1.example.com\n    User bob\n")
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        run = mock.Mock()
+        with mock.patch.object(shw.subprocess, "run", run):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                self.fill(app, host="web1.example.com")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: "already in" in self.status_of(app)
+                )
+                self.assertIsInstance(app.screen, shw.AddHostScreen)
+        run.assert_not_called()
+        self.assertEqual(
+            self.ssh_config.read_text(), "Host web1.example.com\n    User bob\n"
+        )
+
+    async def test_happy_path(self):
+        self.ssh_config.write_text("Host old\n    User bob\n")
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stderr=""))
+        with (
+            mock.patch.object(shw.subprocess, "run", run),
+            self.suspend_stub(),
+            mock.patch.object(shw.SSHWiz, "notify") as notify,
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                user = app.screen.query_one("#add-user", shw.Input).value
+                self.fill(app, host="web1.example.com", name="web")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: not isinstance(app.screen, shw.AddHostScreen)
+                )
+        cfg = self.ssh_config.read_text()
+        self.assertIn("Host old", cfg)  # previous block untouched
+        self.assertIn("Host web", cfg)
+        self.assertIn("HostName web1.example.com", cfg)
+        self.assertIn(f"User {user}", cfg)
+        self.assertIn("IdentityFile", cfg)
+        bak = self.ssh_config.with_name(self.ssh_config.name + shw.CONFIG_BACKUP_SUFFIX)
+        self.assertEqual(bak.read_text(), "Host old\n    User bob\n")
+        calls = [" ".join(c.args[0]) for c in run.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("ssh-copy-id", calls[0])
+        self.assertIn("-i ", calls[0])
+        self.assertIn("BatchMode=yes", calls[1])
+        self.assertTrue(any("added web" in str(c) for c in notify.call_args_list))
+
+    async def test_copyid_failure_stays_open(self):
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        run = mock.Mock(return_value=mock.Mock(returncode=255, stderr=""))
+        with (
+            mock.patch.object(shw.subprocess, "run", run),
+            self.suspend_stub(),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                self.fill(app, host="web1.example.com")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: "ssh-copy-id failed" in self.status_of(app)
+                )
+                self.assertIsInstance(app.screen, shw.AddHostScreen)
+        self.assertFalse(self.ssh_config.exists())
+        self.assertEqual(len(run.call_args_list), 1)
+
+    async def test_probe_nokey_decline(self):
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        run = mock.Mock(
+            side_effect=[
+                mock.Mock(returncode=0, stderr=""),
+                mock.Mock(
+                    returncode=255, stderr="Permission denied (publickey,password)."
+                ),
+            ]
+        )
+        with (
+            mock.patch.object(shw.subprocess, "run", run),
+            self.suspend_stub(),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                self.fill(app, host="web1.example.com")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: isinstance(app.screen, shw.ConfirmScreen)
+                )
+                await pilot.press("n")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.AddHostScreen)
+        self.assertFalse(self.ssh_config.exists())
+
+    async def test_probe_nokey_accept(self):
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        run = mock.Mock(
+            side_effect=[
+                mock.Mock(returncode=0, stderr=""),
+                mock.Mock(returncode=255, stderr="Permission denied (publickey)."),
+            ]
+        )
+        with (
+            mock.patch.object(shw.subprocess, "run", run),
+            self.suspend_stub(),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                self.fill(app, host="web1.example.com")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: isinstance(app.screen, shw.ConfirmScreen)
+                )
+                await pilot.press("y")
+                await self.wait_until(pilot, lambda: self.ssh_config.exists())
+                self.assertNotIsInstance(app.screen, shw.AddHostScreen)
+        cfg = self.ssh_config.read_text()
+        self.assertIn("Host web1.example.com", cfg)
+
+    async def test_generate_key_path(self):
+        keys = Path(tempfile.mkdtemp(prefix="ssh-wiz-wizkeys-"))
+        self.addCleanup(shutil.rmtree, keys, ignore_errors=True)
+        app = shw.SSHWiz()
+        fake_key = keys / "id_ed25519_web1.example.com"
+        gen = mock.Mock(return_value=fake_key)
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stderr=""))
+        with (
+            mock.patch.object(shw, "generate_key", gen),
+            mock.patch.object(shw.subprocess, "run", run),
+            self.suspend_stub(),
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                sel = app.screen.query_one("#add-key", shw.Select)
+                self.assertEqual(sel.value, "")  # empty dir -> generate new
+                self.fill(app, host="web1.example.com")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: not isinstance(app.screen, shw.AddHostScreen)
+                )
+        gen.assert_called_once()
+        self.assertEqual(gen.call_args.args[0], "web1.example.com")
+        self.assertIn(f"IdentityFile {fake_key}", self.ssh_config.read_text())
+
+    async def test_demo_add_host(self):
+        shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        keys = self.make_keys("id_ed25519")
+        app = shw.SSHWiz()
+        run = mock.Mock()
+        with (
+            mock.patch.object(shw.subprocess, "run", run),
+            mock.patch.object(shw.SSHWiz, "notify") as notify,
+        ):
+            async with app.run_test(size=(100, 30)) as pilot:
+                self.push_wizard(app, keys)
+                await pilot.pause()
+                self.fill(app, host="new.example.com")
+                await pilot.pause()
+                await pilot.click("#add-btn")
+                await self.wait_until(
+                    pilot, lambda: not isinstance(app.screen, shw.AddHostScreen)
+                )
+        run.assert_not_called()  # no real ssh in demo mode
+        self.assertTrue(
+            any("would run: ssh-copy-id" in str(c) for c in notify.call_args_list)
+        )
+        self.assertIn("Host new.example.com", shw.SSH_CONFIG.read_text())
 
 
 if __name__ == "__main__":
