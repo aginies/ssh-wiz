@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.3.1] - 2026-10-07
+
+Patch release: the add-host wizard's `ssh-copy-id` step no longer trips
+servers when the local ssh agent holds several keys.
+
+### Fixed
+
+- Add-host wizard: `ssh-copy-id` now runs with `-o PubkeyAuthentication=no`,
+  so ssh skips publickey auth and goes straight to the password prompt.
+  Previously a crowded ssh agent offered every identity first and the server
+  could disconnect with "Too many authentication failures" before the password
+  was even asked for.
+
 ## [1.3.0] - 2026-10-07
 
 Feature release: an add-host wizard (`^a`) that onboards a new host end to
