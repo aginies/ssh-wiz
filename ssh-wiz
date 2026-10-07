@@ -996,10 +996,14 @@ def _port_args(port: str) -> list:
 def build_copyid_cmd(spec: NewHost) -> list:
     """ssh-copy-id command installing spec.key on the host.
 
+    -o PubkeyAuthentication=no: skip publickey auth so ssh goes straight to
+    the password prompt. Without it ssh offers every identity in the agent
+    first, and a server with many of them can bail with "Too many
+    authentication failures" before the password is even asked for.
     No -f: re-runs are idempotent (an already-present key is reported, not
     duplicated). The password is entered by the user on the handed-over
     terminal (the caller runs this inside App.suspend())."""
-    cmd = ["ssh-copy-id", "-i", spec.key]
+    cmd = ["ssh-copy-id", "-i", spec.key, "-o", "PubkeyAuthentication=no"]
     cmd += _port_args(spec.port)
     cmd.append(spec.target)
     return cmd

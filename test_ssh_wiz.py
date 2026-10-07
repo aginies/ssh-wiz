@@ -2122,7 +2122,14 @@ class BuildCopyidCmdTest(unittest.TestCase):
     def test_default_port_no_p(self):
         self.assertEqual(
             shw.build_copyid_cmd(self.spec()),
-            ["ssh-copy-id", "-i", "/home/u/.ssh/id_ed25519", "alice@web1.example.com"],
+            [
+                "ssh-copy-id",
+                "-i",
+                "/home/u/.ssh/id_ed25519",
+                "-o",
+                "PubkeyAuthentication=no",
+                "alice@web1.example.com",
+            ],
         )
 
     def test_nondefault_port(self):
@@ -2132,11 +2139,20 @@ class BuildCopyidCmdTest(unittest.TestCase):
                 "ssh-copy-id",
                 "-i",
                 "/home/u/.ssh/id_ed25519",
+                "-o",
+                "PubkeyAuthentication=no",
                 "-p",
                 "2222",
                 "alice@web1.example.com",
             ],
         )
+
+    def test_no_publickey_auth(self):
+        # skip publickey auth so a crowded ssh agent can't trip the server's
+        # "Too many authentication failures" before the password prompt
+        cmd = shw.build_copyid_cmd(self.spec())
+        self.assertIn("-o", cmd)
+        self.assertIn("PubkeyAuthentication=no", cmd)
 
     def test_no_force_flag(self):
         # re-runs are idempotent: an existing key is reported, not duplicated
