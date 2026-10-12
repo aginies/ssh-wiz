@@ -7,6 +7,8 @@ reads your `~/.ssh/config` and gets you connected.
 - Ordering: favorites first, then A→Z by host within each category
   (the ALL view groups hosts by category)
 - Per-host tmux sessions, ssh options panel (`^o`)
+- Add-host wizard (`^a`): key generation, `ssh-copy-id`, key-auth check,
+  backed-up `~/.ssh/config` append
 - Live ssh command preview below the tabs (exactly what ⏎/^y will run)
 - Fuzzy shell completion for bash, zsh and fish
 - Single file, no build step
@@ -73,6 +75,7 @@ screenshots without exposing real infrastructure.
 | ^e | open `~/.ssh/config` at the selected host (`$EDITOR`) |
 | ^g | open `~/.config/ssh-wiz/categories` (`$EDITOR`), then refresh |
 | ^s | open the twin-panel file sync (local → remote push via rsync) |
+| ^a | open the add-host wizard (key + `ssh-copy-id` + config append) |
 | ? / F1 | show full key help (esc/?/F1/q closes) |
 | ^r | refresh host list |
 | esc | clear filter |
@@ -109,6 +112,32 @@ prompt), and requires `rsync` on the remote host — if it is missing a clear
 message is shown instead of running the command. The destination always gets a
 trailing slash, so a file drops into `dest/file` and a directory into
 `dest/dir/`.
+
+### Add host (`^a`)
+
+`^a` opens a wizard that onboards a new host end to end. Fill in the form
+(host, port, user, optional alias, key) — a live preview shows the exact
+`~/.ssh/config` block that will be written and warns about earlier `Host`
+patterns that would shadow it — then **Add host** runs the staged steps:
+
+1. **Key** — pick an existing keypair or generate a per-host ed25519 key
+   (`~/.ssh/id_ed25519_<host>`, empty passphrase). An existing generated key
+   is only reused with your consent, never overwritten.
+2. **Install** — `ssh-copy-id -o PubkeyAuthentication=no`; the password is
+   entered on the handed-over terminal (skips publickey auth first, so a
+   crowded ssh agent can't trip "Too many authentication failures").
+3. **Verify** — a `BatchMode` ssh probe checks that key auth actually works.
+   If the host refuses the key or is unreachable, the config is *not* written
+   unless you confirm anyway.
+4. **Write** — `~/.ssh/config` is backed up to `~/.ssh/config.bak` (refreshed
+   on every write, mode 0600 — restore with `cp ~/.ssh/config.bak
+   ~/.ssh/config`) and the new block is appended. The write is atomic, and a
+   same-name `Host` block is refused up front.
+
+Any failure keeps the form open so you can fix and retry in place;
+`esc`/`q` cancels without touching anything. In `--demo` mode the config
+write goes to the demo's temp file and keygen/copy-id/probe are shown, not
+run.
 
 ### Shell completion
 

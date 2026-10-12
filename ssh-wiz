@@ -769,8 +769,7 @@ def parse_rsync_listing(output: str) -> list:
         if len(fields) < 5:
             continue
         perms, size, _date, _time, name = fields
-        if name.startswith("./"):
-            name = name[2:]
+        name = name.removeprefix("./")
         if name in (".", ".."):
             continue
         try:
@@ -798,8 +797,7 @@ def parse_itemize(line: str) -> tuple[str, str] | None:
         name = name.rstrip("/")
         return ("d", name) if name not in ("", ".") else None
     if ftype in ("f", "="):
-        if name.startswith("./"):
-            name = name[2:]
+        name = name.removeprefix("./")
         return (ftype, name) if name not in (".", "..") else None
     return None
 
@@ -1378,6 +1376,16 @@ def _tui():
             self.cursor = min(self.cursor, max(0, len(self.shown) - 1))
             self.refresh()
 
+        def select_name(self, name: str) -> None:
+            """Move the cursor to the shown row called `name` (no-op when it
+            is not shown) and refresh — used to restore the cursor after a
+            reload (favorite toggle, connect)."""
+            for i, h in enumerate(self.shown):
+                if h.name == name:
+                    self.cursor = i
+                    break
+            self.refresh()
+
         def render(self) -> Text:
             t = Text(no_wrap=True, end="")
             height = max(1, self.size.height)
@@ -1543,7 +1551,7 @@ def _tui():
 
 
     def sync_help_text() -> str:
-        return "\n".join([
+        lines = [
             "file sync — Midnight Commander style",
             "",
             "  Tab        switch local / remote panel",
@@ -1559,7 +1567,8 @@ def _tui():
             "",
             "  Local -> remote only. rsync must be installed on the",
             "  remote host (key auth, no password).",
-        ])
+        ]
+        return "\n".join(lines)
 
 
     class FileSyncScreen(Screen):
@@ -1949,7 +1958,7 @@ def _tui():
                         feed(buf)
                         buf = ""
                 await proc.wait()
-                err = await err_task
+                _err = await err_task  # drain stderr so the pipe can't fill up
             except FileNotFoundError:
                 # no rsync locally: report it, and let the finally below clear
                 # self.busy or the screen would swallow every key but escape
@@ -2802,11 +2811,7 @@ def _tui():
             host = hl.shown[hl.cursor]
             is_fav = toggle_favorite_file(host.name)
             self.reload()
-            for i, h in enumerate(hl.shown):
-                if h.name == host.name:
-                    hl.cursor = i
-                    break
-            hl.refresh()
+            hl.select_name(host.name)
             verb = "★ added to favorites" if is_fav else "removed from favorites"
             self.notify(f"{verb}: {host.name}", title="ssh-wiz")
 
@@ -2819,12 +2824,7 @@ def _tui():
                 self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
                 record_use(host.name)  # demo state only: usage.json grows on connect
                 self.reload()
-                hl = self.query_one(HostList)
-                for i, h in enumerate(hl.shown):
-                    if h.name == host.name:
-                        hl.cursor = i
-                        break
-                hl.refresh()
+                self.query_one(HostList).select_name(host.name)
                 return
             cmd = build_ssh_cmd(host, self.enabled_options(), self.tmux_mode)
             self.connecting = True
@@ -2842,12 +2842,7 @@ def _tui():
             finally:
                 self.connecting = False
             self.reload()
-            hl = self.query_one(HostList)
-            for i, h in enumerate(hl.shown):
-                if h.name == host.name:
-                    hl.cursor = i
-                    break
-            hl.refresh()
+            self.query_one(HostList).select_name(host.name)
             self.notify(f"ssh exit {rc}: {host.name}",
                         severity="information" if rc == 0 else "warning")
 
@@ -2934,6 +2929,32 @@ def _tui():
             panel.refresh()
             self.update_status()
 
+        def _run_editor(self, path: Path, line: int | None = None) -> bool:
+            """Open `path` (at 1-based `line`, when the editor supports it) in
+            $EDITOR/$VISUAL (vi fallback) on the handed-over terminal.
+            Returns False when the terminal does not support suspend (already
+            notified); callers reload only on True."""
+            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+            parts = shlex.split(editor)
+            editor_bin = Path(parts[0]).name
+            if line is None:
+                args = parts + [str(path)]
+            elif editor_bin == "code":
+                args = parts + ["-g", f"{path}:{line}"]
+            elif editor_bin in ("vi", "vim", "nvim", "emacs", "micro"):
+                args = parts + [f"+{line}", str(path)]
+            else:
+                args = parts + [str(path)]
+                self.notify(f"{editor_bin} can't jump to a line — "
+                            f"opened {path.name} at top", severity="warning")
+            try:
+                with self.suspend():
+                    subprocess.run(args, check=False)
+            except SuspendNotSupported:
+                self.notify("terminal does not support suspend", severity="error")
+                return False
+            return True
+
         def edit_config(self) -> None:
             if DEMO:
                 self.notify("demo mode — no real config to edit",
@@ -2948,24 +2969,8 @@ def _tui():
                 line = 1
                 self.notify(f"{host.name} not in ~/.ssh/config — opening top",
                             severity="warning")
-            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-            parts = shlex.split(editor)
-            editor_bin = Path(parts[0]).name
-            if editor_bin == "code":
-                args = parts + ["-g", f"{SSH_CONFIG}:{line}"]
-            elif editor_bin in ("vi", "vim", "nvim", "emacs", "micro"):
-                args = parts + [f"+{line}", str(SSH_CONFIG)]
-            else:
-                args = parts + [str(SSH_CONFIG)]
-                self.notify(f"{editor_bin} can't jump to a line — "
-                            f"opened ~/.ssh/config at top", severity="warning")
-            try:
-                with self.suspend():
-                    subprocess.run(args, check=False)
-            except SuspendNotSupported:
-                self.notify("terminal does not support suspend", severity="error")
-                return
-            self.reload()
+            if self._run_editor(SSH_CONFIG, line):
+                self.reload()
 
         def edit_categories(self) -> None:
             """Open the categories file in $EDITOR, then reload (tabs, colors
@@ -2975,15 +2980,8 @@ def _tui():
             if not path.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(CATEGORIES_TEMPLATE)
-            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-            args = shlex.split(editor) + [str(path)]
-            try:
-                with self.suspend():
-                    subprocess.run(args, check=False)
-            except SuspendNotSupported:
-                self.notify("terminal does not support suspend", severity="error")
-                return
-            self.reload()
+            if self._run_editor(path):
+                self.reload()
 
         # -- keys
 
@@ -3397,7 +3395,17 @@ def run_main(args: list) -> None:
     password_mode = False
     tmux_mode = False
     rest = []
-    for a in args:
+    # ssh-wiz flags are parsed only up to the first positional (the host);
+    # everything after it is the remote command verbatim, so its own
+    # dashed args are passed through ('ssh-wiz web1 ls -l'). '--' also
+    # ends flag parsing explicitly.
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            rest.extend(args[i:])
+            break
         if a in ("-p", "--password"):
             password_mode = True
         elif a in ("-t", "--tmux"):
@@ -3406,6 +3414,8 @@ def run_main(args: list) -> None:
             sys.exit(f"ssh-wiz: unknown option: {a} (see -h)")
         else:
             rest.append(a)
+            rest.extend(args[i:])  # host + remote command, verbatim
+            break
     if not rest:
         print(__doc__.strip())
         return

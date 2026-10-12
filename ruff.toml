@@ -1,2 +1,12 @@
-# Default rule set. (textual is imported inside _tui() rather than at
+# Explicit, stable rule set — pinned so lint results don't drift when ruff
+# changes its defaults. (textual is imported inside _tui() rather than at
 # module level, so no E402 exception is needed.)
+#
+# The codebase is hand-formatted (single-file layout, aligned continuations);
+# `ruff format` would rewrite most of it, so formatting is deliberately not
+# enforced — only `ruff check` is.
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+# `l` is used for 'line' in comprehensions throughout; not worth renaming.
+ignore = ["E741"]

@@ -26,15 +26,10 @@ sys.modules["sshwiz"] = shw
 _loader.exec_module(shw)
 shw._tui()  # define the TUI classes; defers the textual import out of module load
 
-_PATH_ATTRS = (
-    "SSH_CONFIG",
-    "EXTRA_HOSTS_FILE",
-    "CATEGORIES_FILE",
-    "FAVORITES_FILE",
-    "USAGE_FILE",
-    "CONFIG_DIR",
-    "STATE_DIR",
-)
+# The module's own list (9 entries) — kept in sync by construction, so
+# setUp/tearDown re-point and restore every path global (incl. OPTIONS_FILE
+# and OPTION_STATE_FILE).
+_PATH_ATTRS = shw._PATH_ATTRS
 
 
 class TempPathsTestCase(unittest.TestCase):
