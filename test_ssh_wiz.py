@@ -439,7 +439,8 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             self.assertEqual([h.name for h in wl.shown], ["alpha", "gamma", "beta"])
             lines = str(wl.render()).splitlines()
             self.assertTrue(lines[0].startswith("★ alpha"))
-            self.assertEqual(lines[1], "─" * 80)
+            divider = "  ·· favorites ·· "
+            self.assertEqual(lines[1], divider + "─" * (80 - len(divider)))
             self.assertTrue(lines[2].startswith(" LAN"))
             self.assertTrue(lines[3].startswith("  gamma"))
             self.assertTrue(lines[4].startswith(" WORK"))
@@ -603,7 +604,6 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 cl = app.query_one(shw.CmdLine)
                 lines = str(cl.render()).splitlines()
                 self.assertIn("ssh alpha", lines[0])
-                self.assertEqual(lines[1], "─" * 80)
                 await pilot.press("down")
                 lines = str(cl.render()).splitlines()
                 self.assertIn("ssh beta", lines[0])
@@ -633,16 +633,16 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 # 109-char command wraps: nothing clipped, tmux suffix visible
                 self.assertIn("ssh -t -o PubkeyAuthentication=no", text)
                 self.assertIn("tmux new -A -s wiz-box", text)
-                # the widget grew from 2 rows to 3 (wrapped command)
-                self.assertEqual(cl.region.height, 3)
+                # the boxed bar grew from 3 rows (border + 1 line) to 4 (2 lines)
+                self.assertEqual(cl.region.height, 4)
 
-    async def test_lines_below_tabs_and_options(self):
+    async def test_tabs_underline_and_options_border(self):
         self.ssh_config.write_text("Host alpha\n  User alice\n")
         app = shw.SSHWiz()
         async with app.run_test(size=(80, 24)):
             tabs = app.query_one("#tabs", shw.Static).styles.border_bottom
             panel = app.query_one(shw.OptionsPanel).styles.border_bottom
-            self.assertEqual(tabs[0], "heavy")
+            self.assertNotEqual(tabs[0], "heavy")  # tabs: active-tab underline
             self.assertEqual(panel[0], "heavy")
 
     async def test_help_overlay(self):

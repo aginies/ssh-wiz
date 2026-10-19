@@ -492,18 +492,21 @@ def build_hosts(rules: list | None = None) -> list[Host]:
     return hosts
 
 
-def _append_display(line: Text, h: Host) -> None:
-    """Append the host's 'user@host[:port]' with per-user colors to line."""
+def _append_display(line: Text, h: Host, *, with_port: bool = True) -> None:
+    """Append the host's 'user@host[:port]' with per-user colors to line.
+
+    The TUI renders port/key as right-aligned columns, so it passes
+    ``with_port=False``; the ``-l`` list keeps the port inline."""
     if h.principal:  # e.g. GSSAPI principal: host (user)
         line.append(h.host, style="bold")
-        if h.port and h.port != "22":
+        if with_port and h.port and h.port != "22":
             line.append(f":{h.port}", style="dim")
         line.append(f" ({h.principal})", style="dim")
     elif h.user:
         line.append(h.user, style=user_color(h.user))
         line.append("@", style=AT_COLOR)
         line.append(h.host, style="bold")
-        if h.port and h.port != "22":
+        if with_port and h.port and h.port != "22":
             line.append(f":{h.port}", style="dim")
     else:  # no user info (direct-connect fallback): plain display
         line.append(h.display)
@@ -1430,14 +1433,16 @@ def _tui():
                        else "no hosts found — check ~/.ssh/config")
                 t.append(f"  {msg}", style="dim")
                 return t
-            # Layout: favorites block, a dim separator, then non-favorites
-            # grouped by category (ALL view) with a header per group. (The top
-            # line above the list is drawn by CmdLine.)
+            width = max(1, self.size.width)
+            name_width = self._name_width()
+            fav_label = "  ·· favorites ·· "
+            # Layout: favorites block, a labeled divider, then non-favorites
+            # grouped by category (ALL view) with a header per group.
             n_fav = favorite_split(self.shown, self.favs)
             rows: list = []
             rows.extend(("host", i) for i in range(n_fav))
             if 0 < n_fav < len(self.shown):
-                rows.append(("sep", None))
+                rows.append(("favsep", None))
             prev_cat = None
             for i in range(n_fav, len(self.shown)):
                 h = self.shown[i]
@@ -1454,32 +1459,56 @@ def _tui():
             self.scroll = max(0, self.scroll)
             for r in range(self.scroll, min(len(rows), self.scroll + height)):
                 kind, ref = rows[r]
-                line = Text()
-                if kind == "sep":
-                    line.append("─" * max(1, self.size.width), style="dim")
+                line = Text(no_wrap=True, end="")
+                if kind == "favsep":
+                    line.append(fav_label, style="bold yellow")
+                    line.append("─" * max(0, width - len(fav_label)), style="dim")
                 elif kind == "hdr":
                     label = f" {ref} "
                     line.append(label,
                                 style="bold " + self.app.cat_colors.get(ref, ""))
-                    line.append("─" * max(0, self.size.width - len(label)),
-                                style="dim")
+                    line.append("─" * max(0, width - len(label)), style="dim")
                 else:
-                    h = self.shown[ref]
-                    fav = h.name in self.favs
-                    line.append("★ " if fav else "  ",
-                                style="yellow" if fav else "dim")
-                    line.append(f"{(h.label or h.name):<32}", style="bold")
-                    line.append(COL_SEP, style="dim")
-                    _append_display(line, h)
-                    if h.identityfile:
-                        line.append(" ")
-                        line.append(f"[{Path(h.identityfile).expanduser().name}]",
-                                    style="cyan dim")
-                    if ref == self.cursor:
-                        line.stylize("reverse")
+                    self._host_row(line, self.shown[ref], name_width, width,
+                                   ref == self.cursor)
                 t.append_text(line)
                 t.append("\n")
             return t
+
+        def _name_width(self) -> int:
+            """Name column width: longest visible name plus padding (keeps
+            the name clear of the separator), clamped so narrow terminals
+            don't clip and wide terminals don't get huge gaps."""
+            longest = max((len(h.label or h.name) for h in self.shown),
+                          default=0)
+            return max(14, min(32, longest + 4))
+
+        def _host_row(self, line: Text, h, name_width: int, width: int,
+                      selected: bool) -> None:
+            """One host row: ★/name │ user@host, port and key right-aligned."""
+            fav = h.name in self.favs
+            line.append("★ " if fav else "  ", style="yellow" if fav else "dim")
+            line.append((h.label or h.name).ljust(name_width), style="bold")
+            line.append(COL_SEP, style="dim")
+            _append_display(line, h, with_port=False)
+            if h.identityfile or (h.port and h.port != "22"):
+                right = Text(end="")
+                if h.port and h.port != "22":
+                    right.append(f":{h.port}", style="dim")
+                if h.identityfile:
+                    if right.cell_len:
+                        right.append(" ")
+                    right.append(Path(h.identityfile).expanduser().name,
+                                 style="cyan dim")
+                pad = width - line.cell_len - right.cell_len
+                if pad > 0:
+                    line.append(" " * pad)
+                line.append_text(right)
+            if selected:
+                pad = width - line.cell_len
+                if pad > 0:
+                    line.append(" " * pad)
+                line.stylize("reverse")
 
         def on_resize(self, event) -> None:
             self.refresh()
@@ -2670,17 +2699,18 @@ def _tui():
 
 
     class CmdLine(Widget):
-        """The final ssh command for the selected host, drawn below the
-        category tabs (options panel when open), with a dim separator line
-        underneath; the line above the command is the tabs/options border.
-        Shows exactly what enter / ^y will run; long commands wrap to a
-        second line instead of being clipped."""
+        """The final ssh command for the selected host, pinned in a boxed
+        bar above the key hints (below the host list). Shows exactly what
+        enter / ^y will run; long commands wrap to a second line instead of
+        being clipped."""
+        BORDER_TITLE = " run "
         DEFAULT_CSS = """
         CmdLine {
             width: 100%;
             height: auto;
-            min-height: 2;
+            min-height: 3;
             background: $surface;
+            border: heavy $border;
         }
         """
 
@@ -2711,15 +2741,13 @@ def _tui():
             self.refresh(layout=True)
 
         def render(self) -> Text:
-            t = Text(end="")
             cmd = (self._last_cmd if self._last_cmd is not None
                    else self._command())
+            t = Text(end="")
             if cmd:
                 t.append(cmd)
             else:
                 t.append("(no host selected)", style="dim")
-            t.append("\n")
-            t.append("─" * max(1, self.size.width), style="dim")
             return t
 
         def on_resize(self, event) -> None:
@@ -2736,12 +2764,18 @@ def _tui():
             color: $text;
             padding: 0 1;
         }
+        #status-left {
+            width: 1fr;
+        }
+        #status-right {
+            width: auto;
+            content-align: right middle;
+        }
         #tabs {
-            height: 2;
+            height: 1;
             background: $surface;
             color: $text;
             padding: 0 1;
-            border-bottom: heavy $border;
         }
         #hints {
             height: 1;
@@ -2769,11 +2803,13 @@ def _tui():
             self.current_cat = ALL_CATEGORY
 
         def compose(self) -> ComposeResult:
-            yield Static("", id="status")
+            with Horizontal(id="status"):
+                yield Static("", id="status-left")
+                yield Static("", id="status-right")
             yield Static("", id="tabs")
             yield OptionsPanel()
-            yield CmdLine()
             yield HostList()
+            yield CmdLine()
             yield Static(hints_text(), id="hints")
 
         # -- data
@@ -2803,7 +2839,7 @@ def _tui():
                 color = self.cat_colors.get(cat, "")
                 label = f" {cat} ({n}) "
                 if cat == self.current_cat:
-                    t.append(label, style=f"{color} bold reverse")
+                    t.append(label, style=f"{color} bold underline")
                 else:
                     t.append(label, style=color)
             self.query_one("#tabs", Static).update(t)
@@ -2820,21 +2856,22 @@ def _tui():
 
         def update_status(self) -> None:
             hl = self.query_one(HostList)
-            parts = []
+            left: list[str] = []
             if DEMO:
-                parts.append("[bold magenta]DEMO MODE[/] (sample data — "
-                             "no real connections)")
+                left.append("[bold magenta]DEMO[/]")
             if self.option_state and any(self.option_state.values()):
                 enabled = [l for l, _v in self.options
                            if self.option_state.get(l)]
-                parts.append("opts: " +
-                             " ".join(f"[bold]{escape(l)}[/]" for l in enabled))
+                left.append("opts: " +
+                            " ".join(f"[bold]{escape(l)}[/]" for l in enabled))
             if self.tmux_mode:
-                parts.append("[bold green]TMUX[/] (tmux new -A -s wiz-<host>)")
+                left.append("[bold green]tmux[/]")
+            right: list[str] = []
             if hl.filter:
-                parts.append(f"filter: [bold]{escape(hl.filter)}[/]")
-            parts.append(f"{len(hl.shown)}/{len(hl.hosts)} hosts")
-            self.query_one("#status", Static).update("   ".join(parts))
+                right.append(f"filter: [bold]{escape(hl.filter)}[/]▎")
+            right.append(f"{len(hl.shown)}/{len(hl.hosts)} hosts")
+            self.query_one("#status-left", Static).update("   ".join(left))
+            self.query_one("#status-right", Static).update("   ".join(right))
             self.update_cmd()
 
         def update_cmd(self) -> None:
@@ -2871,7 +2908,7 @@ def _tui():
                 return
             cmd = build_ssh_cmd(host, self.enabled_options(), self.tmux_mode)
             self.connecting = True
-            self.query_one("#status", Static).update(
+            self.query_one("#status-left", Static).update(
                 f"[bold cyan]⏳ ssh {escape(host.display)} — terminal handed over…[/]")
             try:
                 with self.suspend():
