@@ -55,10 +55,10 @@ ssh-wiz -h           this help
 ### Demo mode
 
 `ssh-wiz --demo` runs the picker with built-in sample data — fake hosts on
-the RFC 2606 `example.*` domains, sample categories, favorites and usage
-stats. Your real `~/.ssh/config` and state are never read or written, and
-Enter only shows the ssh command that would be run. Useful for demos and
-screenshots without exposing real infrastructure.
+the RFC 2606 `example.*` domains, sample categories and favorites. Your
+real `~/.ssh/config` and state are never read or written, and Enter only
+shows the ssh command that would be run. Useful for demos and screenshots
+without exposing real infrastructure.
 
 ### TUI keys
 
@@ -214,10 +214,6 @@ comp       Compression=yes|auto
 ### `~/.config/ssh-wiz/favorites` — favorites
 
 One host name per line; `#` starts a comment.
-
-### `~/.local/state/ssh-wiz/usage.json` — usage stats
-
-Written by ssh-wiz (last 50 connect timestamps per host). Don't edit.
 
 ## Tests
 

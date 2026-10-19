@@ -78,7 +78,6 @@ SSH_CONFIG = _ssh_config_path()
 CONFIG_DIR = Path.home() / ".config" / "ssh-wiz"
 STATE_DIR = Path.home() / ".local" / "state" / "ssh-wiz"
 FAVORITES_FILE = CONFIG_DIR / "favorites"
-USAGE_FILE = STATE_DIR / "usage.json"
 EXTRA_HOSTS_FILE = CONFIG_DIR / "hosts"
 CATEGORIES_FILE = CONFIG_DIR / "categories"
 OPTIONS_FILE = CONFIG_DIR / "options"           # ^o panel: which options
@@ -86,7 +85,7 @@ OPTION_STATE_FILE = STATE_DIR / "options.json"  # ^o panel: last values
 # --demo: all data files are pointed at a temp dir with sample data
 # (start_demo/stop_demo); the real config and state are never touched.
 _PATH_ATTRS = ("SSH_CONFIG", "CONFIG_DIR", "STATE_DIR", "FAVORITES_FILE",
-               "USAGE_FILE", "EXTRA_HOSTS_FILE", "CATEGORIES_FILE",
+               "EXTRA_HOSTS_FILE", "CATEGORIES_FILE",
                "OPTIONS_FILE", "OPTION_STATE_FILE")
 # Header written to a freshly created categories file (^g).
 CATEGORIES_TEMPLATE = """\
@@ -137,7 +136,8 @@ class Host:
     name: str                 # unique key: config name, or 'name (user)' for a
                               # second+ user of the same host
     display: str              # plain 'user@host[:port]' (status lines, no-user rows)
-    target: str               # what is passed to ssh
+    target: str               # what is passed to ssh (never carries a port:
+                              # that travels via cmd_port as -p)
     label: str = ""           # name column in TUI/-l (defaults to name)
     category: str = OTHER_CATEGORY
     user: str | None = None       # display only (ssh resolves it from config)
@@ -206,37 +206,6 @@ def category_colors(hosts: list[Host], rules: list) -> dict:
 
 
 # --------------------------------------------------------------- storage
-
-def load_usage() -> dict:
-    """{host: [connect timestamps]} — malformed entries are dropped, so a
-    hand-edited usage.json can never crash the tool."""
-    try:
-        data = json.loads(USAGE_FILE.read_text())
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    usage = {}
-    for name, ts in data.items():
-        if not isinstance(ts, list):
-            continue
-        clean = [t for t in ts
-                 if isinstance(t, (int, float)) and not isinstance(t, bool)]
-        if clean:
-            usage[name] = clean
-    return usage
-
-
-def record_use(name: str) -> None:
-    usage = load_usage()
-    ts = usage.get(name, [])
-    ts.append(time.time())
-    usage[name] = ts[-50:]
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = USAGE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(usage))
-    os.replace(tmp, USAGE_FILE)
-
 
 _CONFIG_CACHE: dict = {}
 
@@ -346,8 +315,41 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
     return hosts, order
 
 
+_DANGEROUS_SSH_OPTS = ("ProxyCommand", "LocalCommand", "RemoteCommand",
+                       "PermitLocalCommand")
+
+
+def _sanitize_extra_args(args: list, line: str) -> list:
+    """Drop ssh -o options that would hand command execution to remote
+    config. ~/.config/ssh-wiz/hosts is trusted like ~/.ssh/config, but the
+    most dangerous tokens are cheap to strip, so they are (defense in
+    depth)."""
+    out = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        opt = ""
+        if a.startswith("-o") and len(a) > 2:
+            opt = a[2:].lstrip("=")         # -oProxyCommand=… / -o=ProxyCommand=…
+        elif a == "-o" and i + 1 < len(args):
+            opt = args[i + 1]
+        key = opt.split("=", 1)[0] if opt else ""
+        if key in _DANGEROUS_SSH_OPTS:
+            print(f"ssh-wiz: dropping dangerous extra arg {a!r} "
+                  f"in {line!r}", file=sys.stderr)
+            if a == "-o" and i + 1 < len(args):
+                i += 1  # also drop the option value
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def parse_extra_hosts(path: Path) -> list:
-    """~/.config/ssh-wiz/hosts — one per line:  name  user@host[:port]  [extra ssh args]"""
+    """~/.config/ssh-wiz/hosts — one per line:  name  user@host[:port]  [extra ssh args].
+    This file sits at the user's own trust boundary (~/.config, like
+    ~/.ssh/config): its `extra` column is spliced into ssh/rsync argv."""
     entries = []
     lines = _read_config_lines(path)
     if lines is None:
@@ -362,11 +364,13 @@ def parse_extra_hosts(path: Path) -> list:
         extra = parts[2] if len(parts) > 2 else ""
         if extra:
             try:
-                shlex.split(extra)
+                extra_args = shlex.split(extra)
             except ValueError:
                 print(f"ssh-wiz: ignoring malformed extra args: {line!r}",
                       file=sys.stderr)
                 extra = ""
+            else:
+                extra = shlex.join(_sanitize_extra_args(extra_args, line))
         entries.append({
             "name": parts[0],
             "target": parts[1],
@@ -460,10 +464,10 @@ def build_hosts(rules: list | None = None) -> list[Host]:
     for e in parse_extra_hosts(EXTRA_HOSTS_FILE):
         if any(h.name == e["name"] for h in hosts):
             continue
-        target = e["target"]
-        user, at, rest = target.partition("@")
+        raw = e["target"]
+        user, at, rest = raw.partition("@")
         if not at:  # no user given: whole target is the host
-            user, rest = "", target
+            user, rest = "", raw
         hostpart, port = rest, ""
         inner, sep, maybe_port = rest.rpartition(":")
         if sep and maybe_port.isdigit():
@@ -472,6 +476,10 @@ def build_hosts(rules: list | None = None) -> list[Host]:
             elif ":" not in inner:
                 hostpart, port = inner, maybe_port  # host:port
         # else: bare host, or bare IPv6 (no port)
+        # The port goes to ssh as -p (cmd_port), never into the target:
+        # ssh would treat 'host:port' as the hostname and fail to resolve,
+        # and rsync would treat it as part of the remote path.
+        target = f"{user}@{hostpart}" if user else hostpart
         user = user or _default_user()
         display = user + "@" + hostpart + (f":{port}" if port else "")
         hosts.append(Host(
@@ -678,14 +686,15 @@ def _control_path() -> str | None:
     return None
 
 
-def _rsync_ssh_shell(host: Host, options: list | None = None) -> str:
-    """The `-e` shell rsync uses to reach the host: ssh with the same
-    port/identityfile/options ssh would (ssh's port flag is -p, lowercase).
-    ControlMaster multiplexes every sync-screen connection (listing,
-    version probe, delete, transfer) over one SSH socket: the first
-    operation pays the handshake, the rest reuse the master, which lingers
-    60 s (ControlPersist) so consecutive directory hops stay fast."""
-    parts = ["ssh"]
+def _rsync_ssh_argv(host: Host, options: list | None = None) -> list:
+    """ssh argv (without the 'ssh' itself) that reaches the host: the same
+    port/identityfile/options ssh would get (ssh's port flag is -p,
+    lowercase). ControlMaster multiplexes every sync-screen connection
+    (listing, version probe, delete, transfer) over one SSH socket: the
+    first operation pays the handshake, the rest reuse the master, which
+    lingers 60 s (ControlPersist) so consecutive directory hops stay fast.
+    """
+    parts = []
     if host.cmd_port:
         parts += ["-p", host.cmd_port]
     if host.identityfile:
@@ -702,7 +711,16 @@ def _rsync_ssh_shell(host: Host, options: list | None = None) -> str:
             parts += shlex.split(host.extra)
         except ValueError:
             pass  # malformed extra args: already warned at parse time
-    return " ".join(parts)
+    return parts
+
+
+def _rsync_ssh_shell(host: Host, options: list | None = None) -> str:
+    """The `-e` shell string rsync uses to reach the host: 'ssh ' + argv.
+    rsync splits this string on whitespace itself, so it can only carry
+    space-free args (rsync's own limitation); the direct-ssh call sites
+    (remote version probe, F8 delete) use _rsync_ssh_argv and pass real
+    argv instead, so extra args with spaces survive."""
+    return " ".join(["ssh", *_rsync_ssh_argv(host, options)])
 
 
 def build_transfer_cmd(host: Host, options: list | None = None,
@@ -862,17 +880,27 @@ def fmt_speed(bps: float) -> str:
 
 
 _RSYNC_VER_RE = re.compile(r"version (\d+)\.(\d+)\.(\d+)")
+_RSYNC_VER_UNPROBED = object()
+_LOCAL_RSYNC_VERSION = _RSYNC_VER_UNPROBED  # cached: version or None
 
 
 def local_rsync_version() -> tuple | None:
-    """(major, minor, patch) of the local rsync, or None if not installed."""
-    try:
-        out = subprocess.run(["rsync", "--version"], capture_output=True,
-                             text=True, check=False)
-    except (FileNotFoundError, OSError):
-        return None
-    m = _RSYNC_VER_RE.search(out.stdout)
-    return tuple(int(x) for x in m.groups()) if m else None
+    """(major, minor, patch) of the local rsync, or None if not installed.
+    Probed once and cached for the process lifetime: the version can't
+    change under us, and do_copy runs on the UI thread, so the subprocess
+    must not happen there on every F5."""
+    global _LOCAL_RSYNC_VERSION
+    if _LOCAL_RSYNC_VERSION is _RSYNC_VER_UNPROBED:
+        try:
+            out = subprocess.run(["rsync", "--version"], capture_output=True,
+                                 text=True, check=False)
+        except (FileNotFoundError, OSError):
+            _LOCAL_RSYNC_VERSION = None
+        else:
+            m = _RSYNC_VER_RE.search(out.stdout)
+            _LOCAL_RSYNC_VERSION = (tuple(int(x) for x in m.groups())
+                                    if m else None)
+    return _LOCAL_RSYNC_VERSION
 
 
 def find_host(name: str) -> Host:
@@ -1206,6 +1234,7 @@ def append_host_to_config(spec: NewHost, path: Path | None = None,
         base += "\n"  # one blank line between the old config and the block
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(base + render_config_block(spec, when))
+    os.chmod(tmp, 0o600)
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     os.replace(tmp, path)
     os.chmod(path, mode)
@@ -1283,7 +1312,14 @@ def _tui():
         return "\n".join(lines) + "\n"
 
 
-    class HelpScreen(Screen):
+    class _Overlay:
+        """Marker for screens that fully own the keyboard while active
+        (help, confirm, add-host, file-sync). SSHWiz.on_key checks this
+        marker instead of a screen list, so a new overlay screen just
+        inherits it and its keys can never leak to the background host
+        list again."""
+
+    class HelpScreen(_Overlay, Screen):
         """Full key help overlay; ^h opens, esc/^h/q closes. Modal: while
         open it swallows every key (nothing falls through to the app)."""
         CSS = """
@@ -1311,7 +1347,7 @@ def _tui():
             event.stop()
 
 
-    class ConfirmScreen(ModalScreen):
+    class ConfirmScreen(_Overlay, ModalScreen):
         """Small yes/no prompt (modal: dims the screen, swallows every key).
         y/enter = yes, n/esc/q = no; the answer is returned as the pop result."""
         DEFAULT_CSS = """
@@ -1571,7 +1607,7 @@ def _tui():
         return "\n".join(lines)
 
 
-    class FileSyncScreen(Screen):
+    class FileSyncScreen(_Overlay, Screen):
         """Twin-panel file manager (Midnight Commander style): the left panel is
         the local filesystem, the right panel is the selected host's filesystem
         (key auth only — no password prompt). Select items in the local panel and
@@ -1706,7 +1742,7 @@ def _tui():
             version stays None and transfers simply omit the flag."""
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *_rsync_ssh_shell(self.host).split(), self.host.target,
+                    "ssh", *_rsync_ssh_argv(self.host), self.host.target,
                     "rsync", "--version",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL)
@@ -1864,7 +1900,7 @@ def _tui():
                 cmd = " ".join(build_transfer_cmd(
                     self.host, self.app.enabled_options(), "up",
                     [e.path for e in selected], self.remote_path))
-                self.app.notify(f"demo mode — would run:\n{cmd}", title="sync")
+                self.app.notify(f"demo mode — would run:\n{escape(cmd)}", title="sync")
                 return
             self.busy = True
             self._set_progress(0, len(selected), "transferring…")
@@ -2078,15 +2114,21 @@ def _tui():
             e = lst.entry_at_cursor()
             if e is None:
                 return
-            if e.name:
-                if e.is_dir and not e.is_symlink:
-                    msg = f"Delete {e.name}/ and all its contents?"
-                else:
-                    msg = f"Delete {e.name}?"
-                answer = await self.app.push_screen(
-                    ConfirmScreen(msg), wait_for_dismiss=True)
-                if not answer:
-                    return
+            if not e.name:
+                # An empty name would make the delete target the directory
+                # itself (or nothing at all): reject it, don't just skip
+                # the confirmation prompt. _delete_remote's root guard is
+                # the second line of defense.
+                self._update_status("✗ cannot delete an empty path")
+                return
+            if e.is_dir and not e.is_symlink:
+                msg = f"Delete {e.name}/ and all its contents?"
+            else:
+                msg = f"Delete {e.name}?"
+            answer = await self.app.push_screen(
+                ConfirmScreen(msg), wait_for_dismiss=True)
+            if not answer:
+                return
             if self.active == "local":
                 await self._delete_local(e)
             else:
@@ -2131,7 +2173,7 @@ def _tui():
                 remote_cmd = f"rm -rf -- {_sh_quote(full)}"
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *_rsync_ssh_shell(self.host).split(), self.host.target,
+                    "ssh", *_rsync_ssh_argv(self.host), self.host.target,
                     remote_cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -2230,7 +2272,7 @@ def _tui():
                 event.stop()
 
 
-    class AddHostScreen(Screen):
+    class AddHostScreen(_Overlay, Screen):
         """Host onboarding wizard: a form (host, port, user, optional alias,
         key), then staged execution:
 
@@ -2411,6 +2453,8 @@ def _tui():
                 return f"port must be a number 1-65535 (got {s.port!r})"
             if not s.user:
                 return "user is required"
+            if not re.fullmatch(r"[A-Za-z0-9._@-]+", s.user):
+                return "user may only use letters, digits, . _ @ -"
             if s.name and not re.fullmatch(r"[A-Za-z0-9._-]+", s.name):
                 return "name may only use letters, digits, . _ -"
             return None
@@ -2521,7 +2565,7 @@ def _tui():
         async def _stage_copyid(self, spec: NewHost) -> bool:
             cmd = build_copyid_cmd(spec)
             if DEMO:
-                self.app.notify(f"demo — would run: {' '.join(cmd)}",
+                self.app.notify(f"demo — would run: {escape(' '.join(cmd))}",
                                 title="add host")
                 return True
             self._update_status(
@@ -2545,7 +2589,7 @@ def _tui():
         async def _stage_probe(self, spec: NewHost) -> bool:
             if DEMO:
                 self.app.notify(
-                    f"demo — would run: {' '.join(build_probe_cmd(spec))}",
+                    f"demo — would run: {escape(' '.join(build_probe_cmd(spec)))}",
                     title="add host")
                 self._update_status("✓ demo — assuming key auth works")
                 return True
@@ -2813,7 +2857,7 @@ def _tui():
             self.reload()
             hl.select_name(host.name)
             verb = "★ added to favorites" if is_fav else "removed from favorites"
-            self.notify(f"{verb}: {host.name}", title="ssh-wiz")
+            self.notify(f"{verb}: {escape(host.name)}", title="ssh-wiz")
 
         def connect_to(self, host: Host) -> None:
             if self.connecting:
@@ -2821,8 +2865,7 @@ def _tui():
             if DEMO:
                 cmd = " ".join(
                     build_ssh_cmd(host, self.enabled_options(), self.tmux_mode))
-                self.notify(f"demo mode — would run: {cmd}", title="ssh-wiz")
-                record_use(host.name)  # demo state only: usage.json grows on connect
+                self.notify(f"demo mode — would run: {escape(cmd)}", title="ssh-wiz")
                 self.reload()
                 self.query_one(HostList).select_name(host.name)
                 return
@@ -2830,12 +2873,11 @@ def _tui():
             self.connecting = True
             self.query_one("#status", Static).update(
                 f"[bold cyan]⏳ ssh {escape(host.display)} — terminal handed over…[/]")
-            record_use(host.name)
             try:
                 with self.suspend():
                     rc = subprocess.run(cmd, check=False).returncode
             except SuspendNotSupported:
-                self.notify("terminal does not support suspend — run: " + " ".join(cmd),
+                self.notify("terminal does not support suspend — run: " + escape(" ".join(cmd)),
                             severity="error")
                 self.update_status()
                 return
@@ -2843,7 +2885,7 @@ def _tui():
                 self.connecting = False
             self.reload()
             self.query_one(HostList).select_name(host.name)
-            self.notify(f"ssh exit {rc}: {host.name}",
+            self.notify(f"ssh exit {rc}: {escape(host.name)}",
                         severity="information" if rc == 0 else "warning")
 
         def do_connect(self) -> None:
@@ -2858,7 +2900,7 @@ def _tui():
             right. Local -> remote only (key auth, no password)."""
             hl = self.query_one(HostList)
             if not hl.shown:
-                self.app.notify("no hosts shown — select one first", title="sync", severity="warning")
+                self.notify("no hosts shown — select one first", title="sync", severity="warning")
                 return
             self.push_screen(FileSyncScreen(hl.shown[hl.cursor]))
 
@@ -2967,7 +3009,7 @@ def _tui():
             line = find_config_line(host.host or host.name)
             if line is None:
                 line = 1
-                self.notify(f"{host.name} not in ~/.ssh/config — opening top",
+                self.notify(f"{escape(host.name)} not in ~/.ssh/config — opening top",
                             severity="warning")
             if self._run_editor(SSH_CONFIG, line):
                 self.reload()
@@ -2991,14 +3033,12 @@ def _tui():
                 self.exit()
                 event.stop()
                 return
-            # While an overlay screen (help / confirm / add-host /
-            # file-sync) is active it owns the keyboard: its on_key and
-            # the focused widget handle the key. Any key that still leaks
-            # here must NOT mutate the background host list. (Add new
-            # overlay screens to this tuple.)
-            if any(isinstance(s, (HelpScreen, ConfirmScreen, AddHostScreen,
-                                  FileSyncScreen))
-                   for s in self.screen_stack):
+            # While an overlay screen is active it owns the keyboard: its
+            # on_key and the focused widget handle the key. Any key that
+            # still leaks here must NOT mutate the background host list.
+            # Overlay screens inherit the _Overlay marker, so a new one
+            # can't be forgotten.
+            if any(isinstance(s, _Overlay) for s in self.screen_stack):
                 return
             hl = self.query_one(HostList)
             if key in ("ctrl+h", "question_mark", "f1"):
@@ -3077,9 +3117,9 @@ def _tui():
                     host = hl.shown[hl.cursor]
                     cmd = " ".join(build_ssh_cmd(host, self.enabled_options()))
                     if copy_to_clipboard(cmd):
-                        self.notify(f"copied: {cmd}")
+                        self.notify(f"copied: {escape(cmd)}")
                     else:
-                        self.notify(f"no clipboard tool (wl-copy/xclip/xsel/pbcopy) — {cmd}",
+                        self.notify(f"no clipboard tool (wl-copy/xclip/xsel/pbcopy) — {escape(cmd)}",
                                     severity="warning")
                 event.stop()
             elif key == "ctrl+e":
@@ -3163,7 +3203,7 @@ __ssh_wiz() {
     # connectable 'user@host' token (never 'user' then 'user@host')
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(ssh-wiz --complete "$cur" 2>/dev/null) )
-    elif [[ "$COMP_CWORD" -eq 1 || "$prev" == -f || "$prev" == -p || "$prev" == -t ]]; then
+    elif [[ "$COMP_CWORD" -eq 1 || "$prev" == -f || "$prev" == -p || "$prev" == --password || "$prev" == -t || "$prev" == --tmux ]]; then
         COMPREPLY=( $(ssh-wiz --complete-hosts "$cur" 2>/dev/null) )
     fi
 }
@@ -3180,7 +3220,7 @@ __ssh_wiz() {
         local -a cands
         cands=("${(@f)$(ssh-wiz --complete "$cur" 2>/dev/null)}")
         (( ${#cands} )) && reply=($cands)
-    elif [[ "$CURRENT" -eq 2 || "$prev" == -f || "$prev" == -p || "$prev" == -t ]]; then
+    elif [[ "$CURRENT" -eq 2 || "$prev" == -f || "$prev" == -p || "$prev" == --password || "$prev" == -t || "$prev" == --tmux ]]; then
         local -a cands
         cands=("${(@f)$(ssh-wiz --complete-hosts "$cur" 2>/dev/null)}")
         (( ${#cands} )) && reply=($cands)
@@ -3195,12 +3235,14 @@ complete -c ssh-wiz -s l -l list -d 'list hosts (favorites first, A→Z), no TUI
 complete -c ssh-wiz -s f -r -d 'toggle favorite (takes host)'
 complete -c ssh-wiz -s p -l password -d 'connect with -o PubkeyAuthentication=no'
 complete -c ssh-wiz -s t -l tmux -d 'connect in per-host tmux session'
+complete -c ssh-wiz -l demo -d 'run against built-in sample data (no real config)'
+complete -c ssh-wiz -s V -l version -d 'print version'
 complete -c ssh-wiz -s h -l help -d 'show help'
 complete -c ssh-wiz -l complete -d 'print hosts/flags matching prefix (completion backend)'
 complete -c ssh-wiz -l completion -d 'print completion script (bash, zsh or fish)'
 # the host argument completes as a single connectable 'user@host' token
 complete -c ssh-wiz -n '__fish_is_first_token' -a '(ssh-wiz --complete-hosts (commandline -cot))' -d 'user@host'
-complete -c ssh-wiz -n '__fish_seen_argument --no-quantifier -f -s f -s p -s t' -a '(ssh-wiz --complete-hosts (commandline -cot))' -d 'user@host'
+complete -c ssh-wiz -n '__fish_seen_argument --no-quantifier -f -s f -s p -s t --password --tmux' -a '(ssh-wiz --complete-hosts (commandline -cot))' -d 'user@host'
 """,
 }
 
@@ -3275,8 +3317,11 @@ def start_demo() -> Path:
     """
     global DEMO, _demo_saved, _demo_root
     global SSH_CONFIG, CONFIG_DIR, STATE_DIR
-    global FAVORITES_FILE, USAGE_FILE, EXTRA_HOSTS_FILE, CATEGORIES_FILE
+    global FAVORITES_FILE, EXTRA_HOSTS_FILE, CATEGORIES_FILE
     global OPTIONS_FILE, OPTION_STATE_FILE
+    if DEMO:
+        raise RuntimeError(
+            "start_demo() called while the demo is already running")
     root = Path(tempfile.mkdtemp(prefix="ssh-wiz-demo-"))
     _demo_saved = {a: globals()[a] for a in _PATH_ATTRS}
     _demo_root = root
@@ -3286,7 +3331,6 @@ def start_demo() -> Path:
     STATE_DIR.mkdir(parents=True)
     SSH_CONFIG = root / "ssh_config"
     FAVORITES_FILE = CONFIG_DIR / "favorites"
-    USAGE_FILE = STATE_DIR / "usage.json"
     EXTRA_HOSTS_FILE = CONFIG_DIR / "hosts"
     CATEGORIES_FILE = CONFIG_DIR / "categories"
     OPTIONS_FILE = CONFIG_DIR / "options"
@@ -3295,14 +3339,6 @@ def start_demo() -> Path:
     EXTRA_HOSTS_FILE.write_text(DEMO_EXTRA_HOSTS)
     CATEGORIES_FILE.write_text(DEMO_CATEGORIES)
     FAVORITES_FILE.write_text("web1.example.com\ngit.example.org\n")
-    now = time.time()
-    USAGE_FILE.write_text(json.dumps({
-        "web1.example.com": [now - 86400],
-        "db1.example.com": [now - 3600],
-        "git.example.org": [now - 60],
-        "web2.example.com": [now - 1800, now - 7200],
-        "bastion.example.net": [now - 43200],
-    }))
     DEMO = True
     return root
 
@@ -3324,9 +3360,18 @@ def stop_demo() -> None:
 
 def main() -> None:
     args = sys.argv[1:]
-    demo = "--demo" in args
+    # --demo is a flag only before the first positional (the host): after
+    # that, args are the remote command verbatim, so 'ssh-wiz web1 echo
+    # --demo' must keep its --demo.
+    demo = False
+    kept = []
+    for a in args:
+        if a == "--demo" and not any(not b.startswith("-") for b in kept):
+            demo = True
+        else:
+            kept.append(a)
+    args = kept
     if demo:
-        args = [a for a in args if a != "--demo"]
         start_demo()
     try:
         run_main(args)
@@ -3430,15 +3475,21 @@ def run_main(args: list) -> None:
     options = [state[label] for label, values in opts
                if state.get(label) in values]
     if password_mode:  # -p: enable PubkeyAuthentication=no
+        enabled = False
         for _label, values in opts:
             if any(v.split("=", 1)[0] == "PubkeyAuthentication"
                    for v in values):
                 for v in values:
                     if v.split("=", 1)[1] == "no":
                         options.append(v)
+                        enabled = True
                         break
                 break
-    record_use(host.name)
+        if not enabled:
+            # the user's options file replaced the defaults without a
+            # PubkeyAuthentication option: fall back to the flag itself
+            # instead of silently connecting with default auth
+            options.append("PubkeyAuthentication=no")
     try:
         os.execvp("ssh", build_ssh_cmd(host, options, tmux_mode, remote_cmd))
     except OSError as e:

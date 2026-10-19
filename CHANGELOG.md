@@ -2,6 +2,44 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Extra hosts with a port (`user@host:port` in `~/.config/ssh-wiz/hosts`):
+  the port is no longer embedded in the ssh target. ssh cannot resolve
+  `host:port` as a hostname, so connecting (TUI, CLI, `^y` copy) failed
+  with "Could not resolve hostname", and file sync was broken too — rsync
+  splits its `user@host:path` URL at the first colon, so the port became
+  part of the remote path. The port now travels to ssh as `-p` only, as
+  the documentation promised.
+- The rsync ssh shell is no longer re-split with `.split()` for the remote
+  version probe and F8 delete: extra ssh args containing spaces
+  (e.g. `-o "SendEnv=A B"`) are passed through as real argv.
+- `--demo` is only recognized before the first positional argument, so
+  `ssh-wiz web1 echo --demo` no longer loses the `--demo` from the remote
+  command.
+- F8 delete of an empty-named entry is rejected instead of skipping the
+  confirmation prompt (an empty name would target the directory itself).
+- `-p/--password` now falls back to `PubkeyAuthentication=no` when the
+  user's options file has no PubkeyAuthentication option, instead of
+  silently connecting with default auth.
+- `local_rsync_version()` is probed once and cached for the process
+  lifetime instead of running a subprocess on the UI thread on every F5.
+- `start_demo()` raises if the demo is already running instead of
+  clobbering the saved real paths.
+- Shell completion: bash/zsh now offer host completions after the long
+  flags `--password`/`--tmux` too, and the fish script lists the missing
+  `--demo` and `-V/--version` flags.
+
+### Removed
+
+- `usage.json` recording: connect timestamps were written on every
+  connect but never read by the app (usage-based ranking was dropped
+  before 1.3.0, leaving the recording dead). `record_use`/`load_usage`
+  and the file are gone; pre-existing `usage.json` files are simply
+  ignored.
+
 ## [1.3.1] - 2026-10-07
 
 Patch release: the add-host wizard's `ssh-copy-id` step no longer trips

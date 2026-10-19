@@ -26,7 +26,7 @@ sys.modules["sshwiz"] = shw
 _loader.exec_module(shw)
 shw._tui()  # define the TUI classes; defers the textual import out of module load
 
-# The module's own list (9 entries) — kept in sync by construction, so
+# The module's own list (8 entries) — kept in sync by construction, so
 # setUp/tearDown re-point and restore every path global (incl. OPTIONS_FILE
 # and OPTION_STATE_FILE).
 _PATH_ATTRS = shw._PATH_ATTRS
@@ -44,7 +44,6 @@ class TempPathsTestCase(unittest.TestCase):
         self.categories = root / "categories"
         self.options_file = root / "options"
         self.favorites = root / "favorites"
-        self.usage = root / "usage.json"
         self.option_state = root / "options.json"
         self._saved = {a: getattr(shw, a) for a in _PATH_ATTRS}
         vars(shw).update(
@@ -54,7 +53,6 @@ class TempPathsTestCase(unittest.TestCase):
                 "CATEGORIES_FILE": self.categories,
                 "OPTIONS_FILE": self.options_file,
                 "FAVORITES_FILE": self.favorites,
-                "USAGE_FILE": self.usage,
                 "OPTION_STATE_FILE": self.option_state,
                 "CONFIG_DIR": root,
                 "STATE_DIR": root,
@@ -242,6 +240,51 @@ class BuildHostsTest(TempPathsTestCase):
         self.categories.write_text("LAN  100.87.*\n")
         hosts = {h.name: h for h in shw.build_hosts()}
         self.assertEqual(hosts["100.87.36.78"].category, "LAN")
+
+
+class ExtraHostPortIntegrationTest(TempPathsTestCase):
+    """Regression: extra hosts with a port (`user@host:port`).
+
+    The port must travel to ssh as -p (cmd_port) only and stay OUT of the
+    target: ssh cannot resolve 'host:port' as a hostname ("Could not
+    resolve hostname host:port"), and rsync splits its user@host:path URL
+    at the first colon, so an embedded port would become part of the
+    remote path. Earlier tests only used synthetic Hosts whose target
+    lacked a port, which is how the bug shipped.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.extra_hosts.write_text("box  bob@example.com:8022\n")
+        self.host = {h.name: h for h in shw.build_hosts()}["box"]
+
+    def test_target_carries_no_port(self):
+        self.assertEqual(self.host.target, "bob@example.com")
+        self.assertEqual(self.host.cmd_port, "8022")
+        self.assertEqual(self.host.display, "bob@example.com:8022")
+
+    def test_find_host_resolves_completion_pair(self):
+        # completion offers 'bob@example.com' (no port); find_host must
+        # resolve it back to the extra host
+        h = shw.find_host("bob@example.com")
+        self.assertEqual(h.name, "box")
+        self.assertEqual(h.target, "bob@example.com")
+
+    def test_ssh_cmd_sends_port_via_dash_p_only(self):
+        cmd = shw.build_ssh_cmd(self.host)
+        self.assertEqual(cmd, ["ssh", "-p", "8022", "bob@example.com"])
+
+    def test_transfer_cmd_upload_url_has_no_port(self):
+        cmd = shw.build_transfer_cmd(self.host, [], "up", ["/tmp/a"], "~/")
+        self.assertEqual(cmd[-1], "bob@example.com:~/")
+        shell = cmd[cmd.index("-e") + 1]
+        self.assertIn("-p 8022", shell)
+
+    def test_transfer_cmd_download_url_has_no_port(self):
+        cmd = shw.build_transfer_cmd(self.host, [], "down", ["/tmp/a"], "~/")
+        self.assertEqual(cmd[-2], "bob@example.com:tmp/a")
+        shell = cmd[cmd.index("-e") + 1]
+        self.assertIn("-p 8022", shell)
 
 
 class FavoriteSplitTest(unittest.TestCase):
@@ -746,27 +789,6 @@ class MiscTest(TempPathsTestCase):
         self.assertEqual(shw.user_color("root"), shw.user_color("root"))
         self.assertIn(shw.user_color("root"), shw.USER_COLORS)
 
-    def test_record_use_caps_and_atomic(self):
-        for _ in range(60):
-            shw.record_use("h")
-        self.assertEqual(len(shw.load_usage()["h"]), 50)
-        self.assertFalse(self.usage.with_suffix(".tmp").exists())
-
-    def test_load_usage_drops_corrupt_entries(self):
-        self.usage.write_text(
-            '{"a": [1.0, "x", 2.5], "b": "garbage", "c": 7, "d": [true]}'
-        )
-        self.assertEqual(shw.load_usage(), {"a": [1.0, 2.5]})
-
-    def test_load_usage_non_dict(self):
-        self.usage.write_text("[1, 2]")
-        self.assertEqual(shw.load_usage(), {})
-
-    def test_record_use_survives_corrupt_entry(self):
-        self.usage.write_text('{"a": "garbage"}')
-        shw.record_use("a")  # must not raise
-        self.assertEqual(len(shw.load_usage()["a"]), 1)
-
     def test_toggle_favorite_file(self):
         self.assertTrue(shw.toggle_favorite_file("a"))
         self.assertIn("a", shw.load_favorites())
@@ -858,7 +880,6 @@ class DemoTest(TempPathsTestCase):
         for f in (
             shw.CATEGORIES_FILE,
             shw.FAVORITES_FILE,
-            shw.USAGE_FILE,
             shw.EXTRA_HOSTS_FILE,
         ):
             self.assertTrue(f.is_file())
@@ -866,6 +887,13 @@ class DemoTest(TempPathsTestCase):
         self.assertFalse(shw.DEMO)
         self.assertFalse(root.exists())
         self.assertEqual(shw.SSH_CONFIG, self.ssh_config)
+
+    def test_start_demo_twice_raises(self):
+        # a second start must not clobber the saved real paths
+        shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        with self.assertRaises(RuntimeError):
+            shw.start_demo()
 
     def test_demo_list_uses_fake_data(self):
         self.ssh_config.write_text("Host realmarker\n  User zed\n")
@@ -947,6 +975,25 @@ class CliTest(TempPathsTestCase):
             self.run_main("-p", "foo")
         args = execvp.call_args[0][1]
         self.assertEqual(args[args.index("-o") + 1], "PubkeyAuthentication=no")
+
+    def test_password_flag_fallback_without_option(self):
+        # a user options file without a PubkeyAuthentication option must
+        # not silently disable -p: fall back to the flag itself
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+        self.options_file.write_text("x11  ForwardX11=yes\n")
+        with mock.patch.object(shw.os, "execvp") as execvp:
+            self.run_main("-p", "foo")
+        args = execvp.call_args[0][1]
+        self.assertIn("PubkeyAuthentication=no", args)
+
+    def test_demo_flag_in_remote_command_is_preserved(self):
+        # --demo after the host belongs to the remote command verbatim
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+        with mock.patch.object(shw.os, "execvp") as execvp:
+            self.run_main("foo", "echo", "--demo")
+        args = execvp.call_args[0][1]
+        self.assertEqual(args[-2:], ["echo", "--demo"])
+        self.assertFalse(shw.DEMO)  # not treated as the flag
 
     def test_cli_uses_saved_option_state(self):
         self.ssh_config.write_text("Host foo\n  User alice\n")
@@ -2056,6 +2103,36 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertNotIsInstance(app.screen, shw.FileSyncScreen)
                 self.assertTrue(stall._killed.is_set())
+
+    async def test_load_remote_url_has_no_port(self):
+        # Regression: the rsync --list-only URL for a port-carrying extra
+        # host must be user@host:path — rsync splits at the first colon,
+        # so the port must not be embedded in the URL (it goes in the -e
+        # shell as -p).
+        self.extra_hosts.write_text("box  bob@example.com:8022\n")
+        app = shw.SSHWiz()
+        calls = []
+
+        async def fake_exec(*cmd, calls=calls, **kw):
+            calls.append(cmd)
+            return _FakeRsyncProc()
+
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=fake_exec),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+
+        list_calls = [c for c in calls if c and c[0] == "rsync" and "--list-only" in c]
+        self.assertTrue(list_calls)
+        cmd = list_calls[0]
+        shell = cmd[cmd.index("-e") + 1]
+        url = cmd[cmd.index("-e") + 2]
+        self.assertEqual(url, "bob@example.com:~/")
+        self.assertIn("-p 8022", shell)
 
 
 class NewHostSpecTest(unittest.TestCase):
