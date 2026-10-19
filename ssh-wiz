@@ -1435,14 +1435,15 @@ def _tui():
                 return t
             width = max(1, self.size.width)
             name_width = self._name_width()
-            fav_label = "  ·· favorites ·· "
-            # Layout: favorites block, a labeled divider, then non-favorites
-            # grouped by category (ALL view) with a header per group.
+            fav_label = " ★ FAVORITES "
+            # Layout: a favorites header (when they form a subset), the
+            # favorites block, then non-favorites grouped by category
+            # (ALL view) with a header per group.
             n_fav = favorite_split(self.shown, self.favs)
             rows: list = []
-            rows.extend(("host", i) for i in range(n_fav))
             if 0 < n_fav < len(self.shown):
-                rows.append(("favsep", None))
+                rows.append(("favhdr", None))
+            rows.extend(("host", i) for i in range(n_fav))
             prev_cat = None
             for i in range(n_fav, len(self.shown)):
                 h = self.shown[i]
@@ -1460,7 +1461,7 @@ def _tui():
             for r in range(self.scroll, min(len(rows), self.scroll + height)):
                 kind, ref = rows[r]
                 line = Text(no_wrap=True, end="")
-                if kind == "favsep":
+                if kind == "favhdr":
                     line.append(fav_label, style="bold yellow")
                     line.append("─" * max(0, width - len(fav_label)), style="dim")
                 elif kind == "hdr":

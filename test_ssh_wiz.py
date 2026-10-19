@@ -430,7 +430,7 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         )
         self.categories.write_text("LAN  alpha\nLAN  gamma\nWORK  beta\n")
 
-    async def test_separator_below_favorites(self):
+    async def test_favorites_header_above_favorites(self):
         self.write_hosts()
         self.favorites.write_text("alpha\n")
         app = shw.SSHWiz()
@@ -438,9 +438,9 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             wl = app.query_one(shw.HostList)
             self.assertEqual([h.name for h in wl.shown], ["alpha", "gamma", "beta"])
             lines = str(wl.render()).splitlines()
-            self.assertTrue(lines[0].startswith("★ alpha"))
-            divider = "  ·· favorites ·· "
-            self.assertEqual(lines[1], divider + "─" * (80 - len(divider)))
+            header = " ★ FAVORITES "
+            self.assertEqual(lines[0], header + "─" * (80 - len(header)))
+            self.assertTrue(lines[1].startswith("★ alpha"))
             self.assertTrue(lines[2].startswith(" LAN"))
             self.assertTrue(lines[3].startswith("  gamma"))
             self.assertTrue(lines[4].startswith(" WORK"))
