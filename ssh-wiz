@@ -952,10 +952,10 @@ def copy_to_clipboard(text: str) -> bool:
 
 def find_config_line(name: str, path: Path | None = None):
     """1-based line of the 'Host <name>' block in the ssh config (or
-    `path`), or None."""
-    try:
-        lines = (path or SSH_CONFIG).read_text().splitlines()
-    except OSError:
+    `path`), or None. Reads through the shared mtime cache like the other
+    storage readers, so it always reflects the latest on-disk content."""
+    lines = _read_config_lines(path or SSH_CONFIG)
+    if lines is None:
         return None
     for i, raw in enumerate(lines, 1):
         parts = raw.split(None, 1)
@@ -1328,7 +1328,16 @@ def _tui():
         (help, confirm, add-host, file-sync). SSHWiz.on_key checks this
         marker instead of a screen list, so a new overlay screen just
         inherits it and its keys can never leak to the background host
-        list again."""
+        list again.
+
+        _confirm is defined here too, so every overlay screen asks for
+        confirmation in exactly one way (via ConfirmScreen)."""
+
+        async def _confirm(self, message: str) -> bool:
+            """Show a yes/no ConfirmScreen for `message` and return the
+            answer (True = yes). The one way the app asks for confirmation."""
+            return bool(await self.app.push_screen(
+                ConfirmScreen(message), wait_for_dismiss=True))
 
     class HelpScreen(_Overlay, Screen):
         """Full key help overlay; ^h opens, esc/^h/q closes. Modal: while
@@ -1786,9 +1795,8 @@ def _tui():
             """Esc/q while a transfer runs: ask before killing it. The transfer
             keeps going in the background while the dialog is open."""
             try:
-                answer = await self.app.push_screen(
-                    ConfirmScreen("Kill the in-progress transfer and quit?"),
-                    wait_for_dismiss=True)
+                answer = await self._confirm(
+                    "Kill the in-progress transfer and quit?")
                 if answer:
                     if self._transfer_proc is not None:
                         self._transfer_proc.kill()
@@ -1955,38 +1963,56 @@ def _tui():
 
         # -- transfer
 
+        def _progress_enabled(self) -> bool:
+            """--info=progress2 (live progress) needs rsync >= 3.1 on BOTH the
+            local and the remote host; gate the flag on both versions."""
+            return ((local_rsync_version() or (0,)) >= (3, 1, 0)
+                    and (self.remote_rsync or (0,)) >= (3, 1, 0))
+
+        def _transfer(self, direction: str, sources: list, dest: str,
+                      arrow: str) -> None:
+            """Push (direction='up') or pull ('down') the selected items into
+            `dest`. `sources` are already built for the direction (local paths
+            for a push, remote_path + '/' + name for a pull). This is the one
+            place a transfer is staged: the demo preview, the busy flag, the
+            progress bar, the status line, the rsync >= 3.1 gate and the
+            worker. `arrow` shows the transfer direction in the status line."""
+            if DEMO:
+                cmd = " ".join(build_transfer_cmd(
+                    self.host, self.app.enabled_options(), direction,
+                    sources, dest))
+                self.app.notify(f"demo mode — would run:\n{escape(cmd)}",
+                                title="sync")
+                return
+            progress = self._progress_enabled()
+            self.busy = True
+            self._set_progress(0, len(sources), "transferring…")
+            self._update_status(
+                f"⏳ transferring {len(sources)} item(s) {arrow} "
+                f"{self.host.display}:{self.remote_path}…")
+            cmd = build_transfer_cmd(
+                self.host, self.app.enabled_options(), direction,
+                sources, dest, progress=progress)
+            self.app.run_worker(
+                self._run_sync(cmd, len(sources), progress, direction))
+
         def do_copy(self) -> None:
+            """F5/c: push the selected local files into the remote panel's
+            current directory."""
             local = self.query_one("#local-list", FileList)
             selected = [e for e in local.entries if e.selected]
             if not selected:
                 self.app.notify("nothing selected — mark files with space",
                                 title="sync", severity="warning")
                 return
-            if DEMO:
-                cmd = " ".join(build_transfer_cmd(
-                    self.host, self.app.enabled_options(), "up",
-                    [e.path for e in selected], self.remote_path))
-                self.app.notify(f"demo mode — would run:\n{escape(cmd)}", title="sync")
-                return
-            self.busy = True
-            self._set_progress(0, len(selected), "transferring…")
-            self._update_status(
-                f"⏳ transferring {len(selected)} item(s) → "
-                f"{self.host.display}:{self.remote_path}…")
-            # live bandwidth needs --info=progress2: rsync >= 3.1 on BOTH ends
-            progress = (local_rsync_version() or (0,)) >= (3, 1, 0) and \
-                (self.remote_rsync or (0,)) >= (3, 1, 0)
-            cmd = build_transfer_cmd(
-                self.host, self.app.enabled_options(), "up",
-                [e.path for e in selected], self.remote_path,
-                progress=progress)
-            self.app.run_worker(self._run_sync(cmd, len(selected), progress))
+            self._transfer("up", [e.path for e in selected], self.remote_path,
+                           "→")
 
         def do_pull(self) -> None:
             """F6/x: pull the selected remote items into the local panel's
-            current directory (mirror of do_copy with the operands reversed).
-            Remote entries are relative to the panel's current directory, so
-            the full remote path is remote_path + '/' + name."""
+            current directory. Remote entries are relative to the panel's
+            current directory, so the full remote path is
+            remote_path + '/' + name."""
             remote = self.query_one("#remote-list", FileList)
             selected = [e for e in remote.entries if e.selected]
             if not selected:
@@ -1995,25 +2021,7 @@ def _tui():
                 return
             sources = [self.remote_path.rstrip("/") + "/" + e.name
                        for e in selected]
-            if DEMO:
-                cmd = " ".join(build_transfer_cmd(
-                    self.host, self.app.enabled_options(), "down",
-                    sources, self.local_path))
-                self.app.notify(f"demo mode — would run:\n{escape(cmd)}", title="sync")
-                return
-            self.busy = True
-            self._set_progress(0, len(selected), "transferring…")
-            self._update_status(
-                f"⏳ transferring {len(selected)} item(s) ← "
-                f"{self.host.display}:{self.remote_path}…")
-            # live bandwidth needs --info=progress2: rsync >= 3.1 on BOTH ends
-            progress = (local_rsync_version() or (0,)) >= (3, 1, 0) and \
-                (self.remote_rsync or (0,)) >= (3, 1, 0)
-            cmd = build_transfer_cmd(
-                self.host, self.app.enabled_options(), "down",
-                sources, self.local_path, progress=progress)
-            self.app.run_worker(
-                self._run_sync(cmd, len(selected), progress, "down"))
+            self._transfer("down", sources, self.local_path, "←")
 
         # The status box is max-height: 14, so keep only this many itemize
         # lines for display (older ones are counted, not rendered); live
@@ -2233,8 +2241,7 @@ def _tui():
                 msg = f"Delete {e.name}/ and all its contents?"
             else:
                 msg = f"Delete {e.name}?"
-            answer = await self.app.push_screen(
-                ConfirmScreen(msg), wait_for_dismiss=True)
+            answer = await self._confirm(msg)
             if not answer:
                 return
             if self.active == "local":
@@ -2593,10 +2600,6 @@ def _tui():
             """Enter in a field starts the add (same as the Add button)."""
             if not self.busy:
                 self.app.run_worker(self._run_wizard())
-
-        async def _confirm(self, message: str) -> bool:
-            return bool(await self.app.push_screen(
-                ConfirmScreen(message), wait_for_dismiss=True))
 
         def _run_probe(self, spec: NewHost) -> tuple:
             """(rc, stderr) of the BatchMode probe, off the UI thread."""
