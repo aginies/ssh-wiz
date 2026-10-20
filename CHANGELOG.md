@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- File-sync screen (`^s`): the active panel was never highlighted, so there
+  was no way to tell whether the cursor was on the local (left) or remote
+  (right) side. The `FileList.active` flag was a plain Python attribute that
+  never matched the `.--active` CSS selector, so the highlight was silently
+  dropped. It is now a real Textual reactive that toggles the `--active`
+  class: the focused panel gets an accent border and a bold, primary-coloured
+  path bar (the other panel stays dim), and both follow the cursor across
+  `Tab`/panel switches.
 - Extra hosts with a port (`user@host:port` in `~/.config/ssh-wiz/hosts`):
   the port is no longer embedded in the ssh target. ssh cannot resolve
   `host:port` as a hostname, so connecting (TUI, CLI, `^y` copy) failed

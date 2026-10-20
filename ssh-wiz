@@ -1268,6 +1268,7 @@ def _tui():
     from textual import events
     from textual.app import App, ComposeResult, SuspendNotSupported
     from textual.containers import Container, Horizontal, Vertical
+    from textual.reactive import Reactive
     from textual.screen import ModalScreen, Screen
     from textual.widget import Widget
     from textual.widgets import Button, Input, ProgressBar, Select, Static
@@ -1520,16 +1521,23 @@ def _tui():
         moves the cursor, space toggles selection. Rendered with a ☐/☑ column,
         a name column and a dim size column; dirs are listed first, then A->Z.
         Hidden ('dot') entries are hidden unless ``show_hidden`` is set (toggled
-        with ``h`` on the screen). The active panel is highlighted with reverse;
-        selection count lives in the screen's path bar."""
+        with ``h`` on the screen). The active panel is highlighted with an
+        accent border (and a brighter path bar) so you always know which side
+        the cursor is on; selection count lives in the screen's path bar."""
         can_focus = True
+        # ``active`` is a real Textual reactive: flipping it toggles the
+        # ``--active`` CSS class below (accent border), so the focused panel is
+        # always visibly highlighted. (A plain attribute would never match the
+        # ``.--active`` selector, which is why the highlight used to be missing.)
+        active = Reactive(False, toggle_class="--active")
         DEFAULT_CSS = """
         FileList {
             width: 100%;
             height: 1fr;
+            border: round $border;
         }
         FileList.--active {
-            border-left: heavy $primary;
+            border: round $accent;
         }
         """
 
@@ -1540,7 +1548,6 @@ def _tui():
             self.cursor = 0
             self.scroll = 0
             self.filter = ""
-            self.active = False
             self.error: str | None = None
             self.show_hidden = False
             self._filtered: tuple | None = None  # (key, rows) cache
@@ -1664,17 +1671,22 @@ def _tui():
             width: 1fr;
         }
         #sync-sep {
-            width: 3;
+            width: 1;
             height: 1fr;
-            background: $panel;
-            border-left: heavy $primary;
-            border-right: heavy $primary;
         }
         .pathbar {
             height: 1;
-            background: $primary;
+            background: $secondary;
             color: $text;
             padding: 0 1;
+        }
+        /* the active panel's path bar uses the theme's primary color + bold so
+           the two panels are never ambiguous; the FileList border below does
+           the same with an accent outline */
+        .pathbar.--active {
+            background: $primary;
+            color: $text;
+            text-style: bold;
         }
         #sync-status {
             width: 95%;
@@ -1802,6 +1814,12 @@ def _tui():
             self.query_one("#remote-path", Static).update(
                 f" remote  {self.host.display}  {self.remote_path}{err}   "
                 f"[bold]{n_remote} selected[/]")
+            # mirror the FileList highlight on the path bars so the active
+            # panel is obvious even before the eye reaches the list
+            self.query_one("#local-path", Static).set_class(
+                self.active == "local", "--active")
+            self.query_one("#remote-path", Static).set_class(
+                self.active == "remote", "--active")
 
         # -- navigation
 
