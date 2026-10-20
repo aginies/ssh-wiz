@@ -4,7 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- File sync (`^s`): pull direction — `F6` (or `x`) copies the selected remote
+  files into the local panel's current directory with the same rsync pipeline
+  as the `F5` push (per-file results, live progress, demo preview). The local
+  panel refreshes after a pull so the new files are visible.
+
 ### Fixed
+
+- `build_transfer_cmd(direction="down")`: absolute remote sources (e.g.
+  `/var/log/syslog`) were stripped of their leading slash and silently fetched
+  from the remote home instead. The down path was unreachable from the UI
+  before `F6`, so this never surfaced.
 
 - File-sync screen (`^s`): the active panel was never highlighted, so there
   was no way to tell whether the cursor was on the local (left) or remote

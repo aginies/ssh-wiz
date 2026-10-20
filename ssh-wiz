@@ -31,7 +31,7 @@ TUI keys:
   ^o        toggle ssh options panel (cycle -o values: no-pubkey, x11, …)
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
-  ^s        open the file-sync screen (twin-panel, local -> remote)
+  ^s        open the file-sync screen (twin-panel, local <-> remote)
   ^a        add host (wizard: key, ssh-copy-id, config block)
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
   ^g        open ~/.config/ssh-wiz/categories ($EDITOR), then refresh
@@ -741,6 +741,10 @@ def build_transfer_cmd(host: Host, options: list | None = None,
     item *itself* (no trailing slash on the source), so a directory lands as a
     new sub-directory rather than spilling its contents.
 
+    In the 'down' direction the remote sources keep their form: an absolute
+    path or a leading ~ is passed through and resolved on the remote side,
+    a bare path is home-relative.
+
     `progress` adds --info=progress2 (live overall progress on stdout); needs
     rsync >= 3.1.0 on both ends, so callers gate it on the probed versions.
     """
@@ -754,7 +758,10 @@ def build_transfer_cmd(host: Host, options: list | None = None,
         cmd.append(f"{host.target}:{dest.rstrip('/')}/")
     else:
         for s in sources:
-            cmd.append(f"{host.target}:{s.lstrip('/')}")
+            # no lstrip('/'): an absolute remote path must stay absolute
+            # (rsync's user@host:/abs/path), a leading ~ is resolved by the
+            # remote shell, and a bare path is home-relative
+            cmd.append(f"{host.target}:{s}")
         cmd.append(os.path.expanduser(dest).rstrip("/") + "/")
     return cmd
 
@@ -890,8 +897,8 @@ _LOCAL_RSYNC_VERSION = _RSYNC_VER_UNPROBED  # cached: version or None
 def local_rsync_version() -> tuple | None:
     """(major, minor, patch) of the local rsync, or None if not installed.
     Probed once and cached for the process lifetime: the version can't
-    change under us, and do_copy runs on the UI thread, so the subprocess
-    must not happen there on every F5."""
+    change under us, and do_copy/do_pull run on the UI thread, so the
+    subprocess must not happen there on every F5/F6."""
     global _LOCAL_RSYNC_VERSION
     if _LOCAL_RSYNC_VERSION is _RSYNC_VER_UNPROBED:
         try:
@@ -1303,7 +1310,7 @@ def _tui():
             lines.append("  ^t          toggle tmux mode (tmux new -A -s wiz-<host>)")
         lines += [
             "  ^y          copy the ssh command for the selected host",
-            "  ^s          file-sync screen (twin-panel local -> remote)",
+            "  ^s          file-sync screen (twin-panel local <-> remote)",
             "  ^a          add host (wizard: key + ssh-copy-id + config)",
             "  ^e          open ~/.ssh/config at the selected host",
             "  ^g          open categories file, then refresh",
@@ -1360,9 +1367,17 @@ def _tui():
         }
         ConfirmScreen #confirm-box {
             width: auto;
+            height: auto;
             border: heavy $primary;
             background: $surface;
             padding: 1 2;
+        }
+        /* textual >= 8.2 Container defaults are width/height 1fr: without
+           height: auto the box stretches to full screen height, and without
+           width: auto on the Statics the box's auto width collapses to
+           border+padding (an invisible dialog) */
+        ConfirmScreen #confirm-box Static {
+            width: auto;
         }
         """
 
@@ -1635,11 +1650,12 @@ def _tui():
             "  h          show/hide hidden (.files)",
             "  *          select all    /   select none",
             "  F5 / c     copy selected local files -> remote",
+            "  F6 / x     copy selected remote files -> local",
             "  ? / F1     this help",
             "  esc / q    close",
             "",
-            "  Local -> remote only. rsync must be installed on the",
-            "  remote host (key auth, no password).",
+            "  Transfers run both directions. rsync must be installed on",
+            "  the remote host (key auth, no password).",
         ]
         return "\n".join(lines)
 
@@ -1648,12 +1664,14 @@ def _tui():
         """Twin-panel file manager (Midnight Commander style): the left panel is
         the local filesystem, the right panel is the selected host's filesystem
         (key auth only — no password prompt). Select items in the local panel and
-        press F5/c to push them into the remote panel's current directory.
+        press F5/c to push them into the remote panel's current directory, or
+        select remote items and press F6/x to pull them into the local panel's
+        current directory.
 
-        Local -> remote only. Remote browsing and transfers use rsync, so rsync
-        must be installed on the remote host; otherwise the remote panel reports
-        the error and offers an scp fallback. Modal: while open it swallows every
-        key (nothing falls through to the app)."""
+        Remote browsing and transfers use rsync, so rsync must be installed on
+        the remote host; otherwise the remote panel reports the error and offers
+        an scp fallback. Modal: while open it swallows every key (nothing falls
+        through to the app)."""
         CSS = """
         FileSyncScreen {
             align: center middle;
@@ -1746,7 +1764,7 @@ def _tui():
                 id="sync-progress", total=0,
                 show_bar=True, show_percentage=True, show_eta=False,
             )
-            yield Static("select files with space · F5 copy · F8 delete · h hidden · ? help",
+            yield Static("select files with space · F5 copy↑ · F6 copy↓ · F8 delete · h hidden · ? help",
                          id="sync-status")
             yield Static("", id="sync-help")
 
@@ -1964,13 +1982,47 @@ def _tui():
                 progress=progress)
             self.app.run_worker(self._run_sync(cmd, len(selected), progress))
 
+        def do_pull(self) -> None:
+            """F6/x: pull the selected remote items into the local panel's
+            current directory (mirror of do_copy with the operands reversed).
+            Remote entries are relative to the panel's current directory, so
+            the full remote path is remote_path + '/' + name."""
+            remote = self.query_one("#remote-list", FileList)
+            selected = [e for e in remote.entries if e.selected]
+            if not selected:
+                self.app.notify("nothing selected — mark files with space",
+                                title="sync", severity="warning")
+                return
+            sources = [self.remote_path.rstrip("/") + "/" + e.name
+                       for e in selected]
+            if DEMO:
+                cmd = " ".join(build_transfer_cmd(
+                    self.host, self.app.enabled_options(), "down",
+                    sources, self.local_path))
+                self.app.notify(f"demo mode — would run:\n{escape(cmd)}", title="sync")
+                return
+            self.busy = True
+            self._set_progress(0, len(selected), "transferring…")
+            self._update_status(
+                f"⏳ transferring {len(selected)} item(s) ← "
+                f"{self.host.display}:{self.remote_path}…")
+            # live bandwidth needs --info=progress2: rsync >= 3.1 on BOTH ends
+            progress = (local_rsync_version() or (0,)) >= (3, 1, 0) and \
+                (self.remote_rsync or (0,)) >= (3, 1, 0)
+            cmd = build_transfer_cmd(
+                self.host, self.app.enabled_options(), "down",
+                sources, self.local_path, progress=progress)
+            self.app.run_worker(
+                self._run_sync(cmd, len(selected), progress, "down"))
+
         # The status box is max-height: 14, so keep only this many itemize
         # lines for display (older ones are counted, not rendered); live
         # progress re-renders are throttled to ~4 Hz.
         _MAX_STATUS_ITEMS = 30
         _RENDER_INTERVAL = 0.25
 
-        async def _run_sync(self, cmd: list, total: int, progress: bool) -> None:
+        async def _run_sync(self, cmd: list, total: int, progress: bool,
+                            direction: str = "up") -> None:
             done = 0
             items: list = []  # last _MAX_STATUS_ITEMS itemize lines (display)
             counts = {"f": 0, "d": 0, "=": 0}  # totals over the whole transfer
@@ -2069,12 +2121,20 @@ def _tui():
                 return
             self._render_sync_status(items, done, total, "done", None,
                                      counts, n_items)
-            # refresh the remote panel so what just arrived is visible
-            self.app.run_worker(self._load_remote())
-            local = self.query_one("#local-list", FileList)
-            for e in local.entries:
-                e.selected = False
-            local.refresh()
+            if direction == "down":
+                # refresh the local panel so what just arrived is visible
+                local = self.query_one("#local-list", FileList)
+                local.entries = await self._list_local()
+                if not self.is_mounted:  # screen closed during the refresh
+                    return
+                local.refresh()
+            else:
+                # refresh the remote panel so what just arrived is visible
+                self.app.run_worker(self._load_remote())
+                local = self.query_one("#local-list", FileList)
+                for e in local.entries:
+                    e.selected = False
+                local.refresh()
 
         def _render_sync_status(self, items, done, total, state, error,
                                 counts=None, n_items=None) -> None:
@@ -2143,7 +2203,7 @@ def _tui():
             for row in (
                 [("space", "select"), ("*", "all"), ("/", "none"),
                  ("h", "hidden"), ("↵", "open"), ("←", "up")],
-                [("F5/c", "copy"), ("F8", "delete"),
+                [("F5/c", "copy ↑"), ("F6/x", "copy ↓"), ("F8", "delete"),
                  ("?/F1", "help"), ("esc", "close")],
             ):
                 for key, action in row:
@@ -2259,6 +2319,9 @@ def _tui():
                 event.stop()
             elif key in ("f5", "c"):
                 self.do_copy()
+                event.stop()
+            elif key in ("f6", "x"):
+                self.do_pull()
                 event.stop()
             elif key == "f8":
                 self.app.run_worker(self._delete_selected())
@@ -2953,7 +3016,8 @@ def _tui():
         def open_file_sync(self) -> None:
             """Open the twin-panel file-sync screen (Ctrl+S) for the selected
             host: local filesystem on the left, the host's filesystem on the
-            right. Local -> remote only (key auth, no password)."""
+            right. Push (F5) and pull (F6) via rsync (key auth, no
+            password)."""
             hl = self.query_one(HostList)
             if not hl.shown:
                 self.notify("no hosts shown — select one first", title="sync", severity="warning")

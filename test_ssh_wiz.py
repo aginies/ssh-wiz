@@ -282,7 +282,8 @@ class ExtraHostPortIntegrationTest(TempPathsTestCase):
 
     def test_transfer_cmd_download_url_has_no_port(self):
         cmd = shw.build_transfer_cmd(self.host, [], "down", ["/tmp/a"], "~/")
-        self.assertEqual(cmd[-2], "bob@example.com:tmp/a")
+        # absolute remote source stays absolute (no port in the URL)
+        self.assertEqual(cmd[-2], "bob@example.com:/tmp/a")
         shell = cmd[cmd.index("-e") + 1]
         self.assertIn("-p 8022", shell)
 
@@ -1214,6 +1215,18 @@ class BuildTransferCmdTest(unittest.TestCase):
         # remote source comes before local dest
         self.assertLess(cmd.index("alice@foo:data/file.txt"), cmd.index("/tmp/out/"))
 
+    def test_download_keeps_absolute_and_tilde_sources(self):
+        # An absolute remote path must stay absolute (rsync's
+        # user@host:/abs/path), a leading ~ is resolved by the remote shell;
+        # neither may be turned home-relative.
+        h = self.make_host()
+        cmd = shw.build_transfer_cmd(
+            h, [], "down", ["/var/log/syslog", "~/out.txt"], "/tmp/out"
+        )
+        self.assertIn("alice@foo:/var/log/syslog", cmd)
+        self.assertIn("alice@foo:~/out.txt", cmd)
+        self.assertTrue(cmd[-1].endswith("/tmp/out/"))
+
 
 class FileListFilteredTest(unittest.TestCase):
     @staticmethod
@@ -1562,6 +1575,70 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertIn("/tmp/r.txt", cmd)
         self.assertIn("foo:~/", cmd[-1])
 
+    async def test_pull_runs_rsync_with_correct_command(self):
+        self.write_hosts()
+        app = shw.SSHWiz()
+        calls = []
+
+        async def fake_exec(*cmd, **kw):
+            calls.append(cmd)
+            return _FakeRsyncProc(["f+++++++++ r.txt", "cd+++++++++ sub/"])
+
+        with (
+            mock.patch.object(
+                shw.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(side_effect=fake_exec),
+            ),
+            mock.patch.object(shw, "parse_rsync_listing", return_value=[]),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.press("tab")  # activate the remote panel
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                remote.entries = [
+                    shw.FileEntry(name="r.txt", path="r.txt", selected=True)
+                ]
+                await pilot.press("f6")
+                await pilot.pause()
+                await pilot.pause()
+        transfer = [
+            c for c in calls if c and c[0] == "rsync" and "--list-only" not in c
+        ]
+        self.assertTrue(transfer, "expected an rsync transfer command")
+        cmd = transfer[0]
+        # remote source (panel dir ~ + name) comes before the local dest
+        self.assertIn("foo:~/r.txt", cmd)
+        dest = cmd[-1]
+        self.assertTrue(dest.endswith("/"))
+        self.assertNotIn("foo", dest)  # dest is local, not user@host:...
+        self.assertLess(cmd.index("foo:~/r.txt"), len(cmd) - 1)
+
+    async def test_demo_pull_previews_not_runs(self):
+        shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        app = shw.SSHWiz()
+        with (
+            mock.patch.object(shw.subprocess, "run") as run,
+            mock.patch.object(
+                shw.asyncio,
+                "create_subprocess_exec",
+                new=mock.AsyncMock(return_value=_FakeRsyncProc(stderr="no rsync")),
+            ),
+            mock.patch.object(shw.SSHWiz, "notify") as notify,
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                await pilot.press("tab")
+                remote = app.screen.query_one("#remote-list", shw.FileList)
+                remote.entries = [
+                    shw.FileEntry(name="r.txt", path="r.txt", selected=True)
+                ]
+                await pilot.press("f6")
+                await pilot.pause()
+        run.assert_not_called()  # demo never runs a real command
+        self.assertTrue(any("would run" in str(c) for c in notify.call_args))
+
     async def test_demo_copy_previews_not_runs(self):
         shw.start_demo()
         self.addCleanup(shw.stop_demo)
@@ -1650,6 +1727,27 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 await pilot.press("y")
                 await pilot.pause()
         self.assertFalse(victim.exists())
+
+    async def test_confirm_box_is_sized_to_content(self):
+        # Regression: textual >= 8.2 ships Container with width/height 1fr
+        # defaults, so the confirm box stretched to full screen height while
+        # its auto width collapsed to border+padding — an invisible dialog.
+        # The box must be a small, centered, content-sized rectangle whose
+        # lines actually occupy visible cells.
+        self.write_hosts()
+        app = shw.SSHWiz()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await app.push_screen(shw.ConfirmScreen("Delete old.txt?"))
+            await pilot.pause()
+            box = app.screen.query_one("#confirm-box", shw.Container)
+            self.assertGreater(box.region.width, 10)
+            self.assertLess(box.region.height, 30)
+            # centered: the box must not touch the screen edges
+            self.assertGreater(box.region.x, 0)
+            self.assertGreater(box.region.y, 0)
+            for child in box.children:
+                self.assertGreater(child.region.width, 0)
+                self.assertGreater(child.region.height, 0)
 
     def _remote_roundtrip(self, cmd: list, home: str, host: str = "foo"):
         """Simulate the ssh round-trip for a delete command: the client joins
