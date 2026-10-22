@@ -252,6 +252,7 @@ def toggle_favorite_file(name: str) -> bool:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = FAVORITES_FILE.with_suffix(".tmp")
     tmp.write_text("\n".join(favs) + "\n")
+    os.chmod(tmp, 0o600)
     os.replace(tmp, FAVORITES_FILE)
     return name in favs
 
@@ -315,30 +316,57 @@ def parse_ssh_config(path: Path) -> tuple[dict, list]:
     return hosts, order
 
 
-_DANGEROUS_SSH_OPTS = ("ProxyCommand", "LocalCommand", "RemoteCommand",
-                       "PermitLocalCommand")
+# ssh -o options the extra-args column is allowed to set. A strict allowlist
+# (not a blacklist): anything not listed here — command-execution options
+# (ProxyCommand/LocalCommand/RemoteCommand/PermitLocalCommand), tunneling
+# (ProxyJump, LocalForward, RemoteForward, …) and forwarding (ForwardX11,
+# ForwardAgent, …) — is dropped, so a writer of ~/.config/ssh-wiz/hosts can
+# never hijack a connection ssh-wiz builds.
+_ALLOWED_SSH_OPTS = frozenset({
+    "BatchMode", "ConnectTimeout", "Compression",
+    "IdentityFile", "LogLevel", "PasswordAuthentication",
+    "PreferredAuthentications", "ServerAliveCountMax",
+    "ServerAliveInterval", "StrictHostKeyChecking",
+    "UserKnownHostsFile", "VisualHostKey",
+})
+# Standalone ssh forwarding/tunneling flags the extra-args column may not
+# carry (the equivalent -o options are excluded by _ALLOWED_SSH_OPTS above).
+_FORWARDED_FLAGS = ("-L", "-R", "-D", "-J", "-W")
 
 
 def _sanitize_extra_args(args: list, line: str) -> list:
-    """Drop ssh -o options that would hand command execution to remote
-    config. ~/.config/ssh-wiz/hosts is trusted like ~/.ssh/config, but the
-    most dangerous tokens are cheap to strip, so they are (defense in
-    depth)."""
+    """Keep only ssh args that are on the allowlist.
+
+    ~/.config/ssh-wiz/hosts is trusted like ~/.ssh/config, but its `extra`
+    column is spliced into the ssh/rsync argv, so it is treated as an
+    untrusted boundary: a strict *allowlist* (not a blacklist) of permitted
+    ssh -o options and flags. Anything not listed here — command-execution
+    options, tunneling (ProxyJump/-L/-R/-D) and forwarding (ForwardX11/
+    ForwardAgent) — is dropped, so a writer of the file can't hijack a
+    connection.
+    """
     out = []
     i = 0
     while i < len(args):
         a = args[i]
-        opt = ""
+        key = ""
         if a.startswith("-o") and len(a) > 2:
-            opt = a[2:].lstrip("=")         # -oProxyCommand=… / -o=ProxyCommand=…
+            key = a[2:].lstrip("=").split("=", 1)[0]  # -oFoo=… / -o=Foo=…
         elif a == "-o" and i + 1 < len(args):
-            opt = args[i + 1]
-        key = opt.split("=", 1)[0] if opt else ""
-        if key in _DANGEROUS_SSH_OPTS:
-            print(f"ssh-wiz: dropping dangerous extra arg {a!r} "
+            key = args[i + 1].split("=", 1)[0]
+        if key and key not in _ALLOWED_SSH_OPTS:
+            print(f"ssh-wiz: dropping disallowed extra arg {a!r} "
                   f"in {line!r}", file=sys.stderr)
             if a == "-o" and i + 1 < len(args):
                 i += 1  # also drop the option value
+            i += 1
+            continue
+        if a in _FORWARDED_FLAGS:
+            print(f"ssh-wiz: dropping disallowed extra arg {a!r} "
+                  f"in {line!r}", file=sys.stderr)
+            # also drop the flag's value token, but not if it is itself a flag
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1
             i += 1
             continue
         out.append(a)
@@ -621,6 +649,7 @@ def save_option_state(state: dict, path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -2269,12 +2298,12 @@ def _tui():
 
         async def _delete_remote(self, e) -> None:
             full = self.remote_path.rstrip("/") + "/" + e.name
-            # Safety: the target must never be empty or the whole filesystem/home.
-            # Reject the root ("/", "//") and the home root ("~", "~/") before we
-            # ever build or send the command, so a missing/empty name can never
-            # become `rm -rf -- /`.
-            root = full.rstrip("/")
-            if not root or root == "~":
+            # Safety: the target must always be ~-relative. Reject anything that
+            # is not, before we ever build or send the command. This blocks both
+            # a missing/empty name becoming `rm -rf -- /` and the _go_up path
+            # where remote_path is '' (so full='/name'): only a '~'-leading path
+            # is allowed, so an absolute target can never reach rm.
+            if not full.startswith("~"):
                 self._update_status(f"✗ cannot delete {e.name}")
                 return
             # The ssh client joins the remote words with plain spaces before the
@@ -2282,10 +2311,7 @@ def _tui():
             # the command string* (single quotes: fully literal, also defeats
             # globs and injection). A leading ~ is sent as $HOME so the remote
             # shell expands it.
-            if full.startswith("~"):
-                remote_cmd = f'rm -rf -- "$HOME"{_sh_quote(full[1:])}'
-            else:
-                remote_cmd = f"rm -rf -- {_sh_quote(full)}"
+            remote_cmd = f'rm -rf -- "$HOME"{_sh_quote(full[1:])}'
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "ssh", *_rsync_ssh_argv(self.host), self.host.target,
