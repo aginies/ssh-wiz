@@ -10,6 +10,10 @@ All notable changes to this project are documented in this file.
   files into the local panel's current directory with the same rsync pipeline
   as the `F5` push (per-file results, live progress, demo preview). The local
   panel refreshes after a pull so the new files are visible.
+- File-sync transfer status now shows an ETA (estimated time remaining) next
+  to the transfer speed while a transfer is in progress, parsed from rsync's
+  own `--info=progress2` output. The ETA disappears when rsync can't estimate
+  it (e.g. speed is still zero at the very start).
 
 ### Fixed
 

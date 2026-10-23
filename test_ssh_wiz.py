@@ -1308,31 +1308,46 @@ class FileSyncParserTest(unittest.TestCase):
         self.assertEqual(shw.fmt_size(1536), "2K")
 
     def test_parse_progress(self):
-        # (cumulative bytes, pct, speed B/s, xfr-done); speed is rsync's own
-        # rate; xfr is None when the sample has no (xfr#N, ...) suffix
-        b, pct, speed, xfr = shw.parse_progress(
+        # (cumulative bytes, pct, speed B/s, eta s, xfr-done); speed is
+        # rsync's own rate; eta is the estimated time remaining; xfr is None
+        # when the sample has no (xfr#N, ...) suffix
+        b, pct, speed, eta, xfr = shw.parse_progress(
             "     41,943,040  99%    1.26GB/s    0:00:00 (xfr#1, to-chk=1/3)"
         )
         self.assertEqual((b, pct, xfr), (41943040, 99, 1))
         self.assertAlmostEqual(speed, 1.26e9, delta=1)
-        # de_DE-style grouping and decimal separators
-        b, pct, speed, xfr = shw.parse_progress(
+        self.assertAlmostEqual(eta, 0.0, delta=1e-3)
+        # de_DE-style grouping and decimal separators, non-zero eta
+        b, pct, speed, eta, xfr = shw.parse_progress(
             "     42.621.440  53%    1,26GB/s    0:00:04 (xfr#1, to-chk=1/2)"
         )
         self.assertEqual((b, pct, xfr), (42621440, 53, 1))
         self.assertAlmostEqual(speed, 1.26e9, delta=1)
+        self.assertAlmostEqual(eta, 4.0, delta=1e-3)
         # -h human-readable size (SI units)
-        b, pct, speed, xfr = shw.parse_progress(
+        b, pct, speed, eta, xfr = shw.parse_progress(
             "     41.94M  99%    1.15GB/s    0:00:00 (xfr#1, to-chk=1/3)"
         )
         self.assertEqual((b, pct, xfr), (41940000, 99, 1))
         # no xfr# suffix (older rsync), zero speed
-        b, pct, speed, xfr = shw.parse_progress(
+        b, pct, speed, eta, xfr = shw.parse_progress(
             "     32,768   0%    0.00kB/s    0:00:00"
         )
-        self.assertEqual((b, pct, speed, xfr), (32768, 0, 0.0, None))
+        self.assertEqual((b, pct, speed, eta, xfr), (32768, 0, 0.0, 0.0, None))
+        # word-form ETA ('1m 0s') and no-suffix ETA
+        b, pct, speed, eta, xfr = shw.parse_progress(
+            "     5,000,000  40%    1.0MB/s    1m 30s"
+        )
+        self.assertAlmostEqual(eta, 90.0, delta=1e-3)
         self.assertIsNone(shw.parse_progress(">f+++++++++ a.bin"))
         self.assertIsNone(shw.parse_progress(""))
+
+    def test_fmt_eta(self):
+        self.assertEqual(shw.fmt_eta(0), "0s")
+        self.assertEqual(shw.fmt_eta(45), "45s")
+        self.assertEqual(shw.fmt_eta(90), "1m 30s")
+        self.assertEqual(shw.fmt_eta(3723), "1h 2m 3s")
+        self.assertEqual(shw.fmt_eta(90060), "1d 1h 1m")
 
     def test_fmt_speed(self):
         self.assertEqual(shw.fmt_speed(120), "120B/s")

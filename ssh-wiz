@@ -868,8 +868,16 @@ def parse_itemize(line: str) -> tuple[str, str] | None:
 _PROGRESS_RE = re.compile(
     r"^(\d+(?:[.,]\d+)*)\s*([KMGTPE])?\s+"
     r"(\d+(?:[.,]\d+)?)\s*%\s+"
-    r"(\d+(?:[.,]\d+)?)\s*(B|kB|MB|GB|TB|PB)/s"
-    r".*?(?:\(xfr#(\d+), to-chk=\d+/\d+\))?\s*$")
+    r"(\d+(?:[.,]\d+)?)\s*(B|kB|MB|GB|TB|PB)/s\s+"
+    r"([^\r(]*?)"                       # eta (rsync: e.g. '45s', '1m 0s')
+    r"(?:\(xfr#(\d+), to-chk=\d+/\d+\))?"
+    r"\s*$")
+
+# rsync --info=progress2 ETA units (case-sensitive: m=minutes, M=months).
+# Colon form 'h:mm:ss' / 'm:ss' is accepted too, in case a build emits it.
+_ETA_MULT = {"s": 1, "m": 60, "h": 3600, "D": 86400, "M": 2592000, "y": 31536000}
+_ETA_PAIR_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*([yMDams])")
+_ETA_COLON_RE = re.compile(r"^\d+(?::\d+)+$")
 
 _HUMAN_MULT = {"": 1, "K": 1000, "M": 10**6, "G": 10**9,
                "T": 10**12, "P": 10**15}
@@ -884,18 +892,36 @@ def _parse_rsync_size(raw: str, unit: str | None) -> int:
     return int(raw.replace(".", "").replace(",", ""))
 
 
+def _parse_eta(raw: str) -> float | None:
+    """rsync ETA field -> seconds (or None if it can't be understood)."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    if _ETA_COLON_RE.match(raw):  # h:mm:ss or m:ss
+        secs = 0.0
+        for part in raw.split(":"):
+            secs = secs * 60 + float(part.replace(",", "."))
+        return secs
+    total = 0.0
+    for num, unit in _ETA_PAIR_RE.findall(raw):
+        total += float(num.replace(",", ".")) * _ETA_MULT[unit]
+    return total if total else None
+
+
 def parse_progress(segment: str):
-    """Parse one progress2 sample -> (bytes_done, pct, speed, xfr_done), or
-    None. bytes_done is cumulative over the whole transfer; speed is rsync's
-    own rate in bytes/s; xfr_done is None when the sample carries no
+    """Parse one progress2 sample -> (bytes_done, pct, speed, eta, xfr_done),
+    or None. bytes_done is cumulative over the whole transfer; speed is
+    rsync's own rate in bytes/s; eta is the estimated time remaining in
+    seconds (or None); xfr_done is None when the sample carries no
     (xfr#N, ...) suffix."""
     m = _PROGRESS_RE.match(segment.strip())
     if not m:
         return None
-    size_raw, unit, pct_raw, speed_raw, speed_unit, xfr = m.groups()
+    size_raw, unit, pct_raw, speed_raw, speed_unit, eta_raw, xfr = m.groups()
     return (_parse_rsync_size(size_raw, unit),
             int(float(pct_raw.replace(",", "."))),
             float(speed_raw.replace(",", ".")) * _SPEED_MULT[speed_unit],
+            _parse_eta(eta_raw),
             int(xfr) if xfr else None)
 
 
@@ -916,6 +942,26 @@ def fmt_speed(bps: float) -> str:
         if bps >= div:
             return f"{bps / div:.1f}{unit}"
     return f"{bps:.0f}B/s"
+
+
+def fmt_eta(seconds: float) -> str:
+    """A remaining-time estimate as rsync-style compact units (2h 3m, 45s)."""
+    if seconds < 0:
+        seconds = 0
+    total = int(seconds + 0.5)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    if not parts or secs:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
 
 
 _RSYNC_VER_RE = re.compile(r"version (\d+)\.(\d+)\.(\d+)")
@@ -1787,6 +1833,7 @@ def _tui():
             self._xfer_bytes = 0
             self._speed = 0.0
             self._pct = 0
+            self._eta = None
             self._avg_speed = 0.0
 
         def compose(self) -> ComposeResult:
@@ -2067,6 +2114,7 @@ def _tui():
             self._xfer_bytes = 0
             self._speed = 0.0
             self._pct = 0
+            self._eta = None
             self._avg_speed = 0.0
             t0 = time.monotonic()
             last_render = 0.0
@@ -2091,10 +2139,11 @@ def _tui():
                     if progress:
                         pg = parse_progress(part)
                         if pg:
-                            b, pct, speed, xfr = pg
+                            b, pct, speed, eta, xfr = pg
                             self._xfer_bytes = b
                             self._pct = pct
                             self._speed = speed
+                            self._eta = eta
                             if xfr is not None:
                                 done = xfr
                             # progress samples arrive continuously; re-rendering
@@ -2202,6 +2251,8 @@ def _tui():
                 t.append(f" ⏳ {state} {done}/{total}…", style="bold cyan")
                 if self._speed > 0:
                     t.append(f"  ·  {fmt_speed(self._speed)}", style="dim")
+                if self._eta is not None and self._eta > 0:
+                    t.append(f"  ·  ETA {fmt_eta(self._eta)}", style="dim")
                 if self._pct:
                     t.append(f"  ·  {self._pct}%", style="dim")
             t.append("\n")
