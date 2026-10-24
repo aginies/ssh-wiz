@@ -84,9 +84,20 @@ OPTIONS_FILE = CONFIG_DIR / "options"           # ^o panel: which options
 OPTION_STATE_FILE = STATE_DIR / "options.json"  # ^o panel: last values
 # --demo: all data files are pointed at a temp dir with sample data
 # (start_demo/stop_demo); the real config and state are never touched.
-_PATH_ATTRS = ("SSH_CONFIG", "CONFIG_DIR", "STATE_DIR", "FAVORITES_FILE",
-               "EXTRA_HOSTS_FILE", "CATEGORIES_FILE",
-               "OPTIONS_FILE", "OPTION_STATE_FILE")
+# Every module-level path the demo can repoint, registered declaratively.
+# start_demo/stop_demo save and restore exactly these (see below), so adding
+# a new path here means it is saved and restored automatically — it can never
+# be left out of the restore bookkeeping the way _PATH_ATTRS once could.
+_DEMO_PATHS = {
+    "SSH_CONFIG": SSH_CONFIG,
+    "CONFIG_DIR": CONFIG_DIR,
+    "STATE_DIR": STATE_DIR,
+    "FAVORITES_FILE": FAVORITES_FILE,
+    "EXTRA_HOSTS_FILE": EXTRA_HOSTS_FILE,
+    "CATEGORIES_FILE": CATEGORIES_FILE,
+    "OPTIONS_FILE": OPTIONS_FILE,
+    "OPTION_STATE_FILE": OPTION_STATE_FILE,
+}
 # Header written to a freshly created categories file (^g).
 CATEGORIES_TEMPLATE = """\
 # ssh-wiz categories — one rule per line:
@@ -653,21 +664,30 @@ def save_option_state(state: dict, path: Path | None = None) -> None:
     os.replace(tmp, path)
 
 
+# ssh args a host is reached with, beyond its target: the ^o options (-o),
+# the port (-p) and the extra args from ~/.config/ssh-wiz/hosts. Both
+# build_ssh_cmd and _rsync_ssh_argv build these, so keeping them in one place
+# stops them drifting apart. IdentityFile and the sync screen's ControlMaster
+# options are rsync-specific and stay in _rsync_ssh_argv.
+def _ssh_common_argv(host: Host, options: list | None = None) -> list:
+    argv = [opt for o in (options or []) for opt in ("-o", o)]
+    if host.cmd_port:
+        argv += ["-p", host.cmd_port]
+    if host.extra:
+        try:
+            argv += shlex.split(host.extra)
+        except ValueError:
+            pass  # malformed extra args: already warned at parse time
+    return argv
+
+
 def build_ssh_cmd(host: Host, options: list | None = None,
                   tmux_mode: bool = False,
                   remote_cmd: list | None = None) -> list:
     cmd = ["ssh"]
     if tmux_mode:
         cmd.append("-t")
-    for opt in options or []:
-        cmd += ["-o", opt]
-    if host.cmd_port:
-        cmd += ["-p", host.cmd_port]
-    if host.extra:
-        try:
-            cmd += shlex.split(host.extra)
-        except ValueError:
-            pass  # malformed extra args: already warned at parse time
+    cmd += _ssh_common_argv(host, options)
     cmd.append(host.target)
     if tmux_mode:
         cmd += ["tmux", "new", "-A", "-s", tmux_session_name(host)]
@@ -727,8 +747,6 @@ def _rsync_ssh_argv(host: Host, options: list | None = None) -> list:
     lingers 60 s (ControlPersist) so consecutive directory hops stay fast.
     """
     parts = []
-    if host.cmd_port:
-        parts += ["-p", host.cmd_port]
     if host.identityfile:
         parts += ["-i", os.path.expanduser(host.identityfile)]
     cp = _control_path()
@@ -736,13 +754,7 @@ def _rsync_ssh_argv(host: Host, options: list | None = None) -> list:
         parts += ["-o", "ControlMaster=auto",
                   "-o", f"ControlPath={cp}",
                   "-o", "ControlPersist=60"]
-    for opt in options or []:
-        parts += ["-o", opt]
-    if host.extra:
-        try:
-            parts += shlex.split(host.extra)
-        except ValueError:
-            pass  # malformed extra args: already warned at parse time
+    parts += _ssh_common_argv(host, options)
     return parts
 
 
@@ -926,14 +938,17 @@ def parse_progress(segment: str):
 
 
 def fmt_size(n: int) -> str:
-    """Human-readable byte size (1.2M, 512B, ...)."""
-    if n < 1024:
+    """Human-readable byte size (1.5MB, 512B, ...), SI decimal (1 MB = 10^6 B).
+
+    Decimal, not binary: it matches rsync's own -h human-readable output
+    (which is SI), so a size parsed from a progress sample and the same size
+    shown here use the same base. Consistent with fmt_speed / _SPEED_MULT."""
+    if n < 1000:
         return f"{n}B"
-    for unit in ("K", "M", "G", "T"):
-        n /= 1024
-        if n < 1024:
-            return f"{n:.0f}{unit}"
-    return f"{n:.0f}P"
+    for mult, unit in ((10**3, "K"), (10**6, "M"), (10**9, "G"), (10**12, "T")):
+        if n < mult * 1000:
+            return f"{n / mult:.0f}{unit}B"
+    return f"{n / 10**15:.0f}PB"
 
 
 def fmt_speed(bps: float) -> str:
@@ -1328,6 +1343,22 @@ def append_host_to_config(spec: NewHost, path: Path | None = None,
 
 # ------------------------------------------------------------------- TUI
 
+def clamp_scroll(scroll: int, crow: int, height: int) -> int:
+    """Clamp `scroll` so viewport row `crow` stays visible in a box of
+    `height` rows.
+
+    Pins the cursor to the top when it scrolls above the viewport, leaves one
+    row of lookahead below it when there is room (so at the end of the list the
+    cursor sits on the last row), and never scrolls past the end. Shared by the
+    host list and both file-sync panels, which otherwise hand-rolled identical
+    scroll math.
+    """
+    scroll = min(scroll, crow)
+    if crow >= scroll + height - 1:
+        scroll = crow - height + 2
+    return max(0, scroll)
+
+
 # Textual is imported only when the TUI actually starts (see _tui()):
 # the CLI paths (-l, -f, --complete, direct connect) must not pay for
 # the ~100 ms textual import. The TUI classes subclass textual classes
@@ -1554,10 +1585,7 @@ def _tui():
             # Keep the cursor visible; when possible leave one row of lookahead
             # below it (at the end of the list the cursor sits on the last row).
             crow = rows.index(("host", self.cursor))
-            self.scroll = min(self.scroll, crow)
-            if crow >= self.scroll + height - 1:
-                self.scroll = crow - height + 2
-            self.scroll = max(0, self.scroll)
+            self.scroll = clamp_scroll(self.scroll, crow, height)
             for r in range(self.scroll, min(len(rows), self.scroll + height)):
                 kind, ref = rows[r]
                 line = Text(no_wrap=True, end="")
@@ -1697,10 +1725,7 @@ def _tui():
             if self.cursor >= len(rows):
                 self.cursor = len(rows) - 1
             crow = self.cursor
-            self.scroll = min(self.scroll, crow)
-            if crow >= self.scroll + height - 1:
-                self.scroll = crow - height + 2
-            self.scroll = max(0, self.scroll)
+            self.scroll = clamp_scroll(self.scroll, crow, height)
             for r in range(self.scroll, min(len(rows), self.scroll + height)):
                 e = rows[r]
                 box = "☑" if e.selected else "☐"
@@ -3523,7 +3548,7 @@ def start_demo() -> Path:
         raise RuntimeError(
             "start_demo() called while the demo is already running")
     root = Path(tempfile.mkdtemp(prefix="ssh-wiz-demo-"))
-    _demo_saved = {a: globals()[a] for a in _PATH_ATTRS}
+    _demo_saved = {name: globals()[name] for name in _DEMO_PATHS}
     _demo_root = root
     CONFIG_DIR = root / "config"
     STATE_DIR = root / "state"
@@ -3664,12 +3689,21 @@ def run_main(args: list) -> None:
     if not rest:
         print(__doc__.strip())
         return
-    host = find_host(rest[0])
     remote_cmd = rest[1:]
+    # Argument-level checks run before host resolution, so a malformed call is
+    # rejected even when the host is unknown.
     if tmux_mode and remote_cmd:
         sys.exit("ssh-wiz: cannot combine -t with a remote command")
     if tmux_mode and not tmux_available():
         sys.exit("ssh-wiz: tmux is not installed")
+    host = find_host(rest[0])
+    # find_host returns a passthrough Host for anything it can't match, so an
+    # unknown host (or a typo) would otherwise exec `ssh <typo>`. ssh-wiz
+    # connects only to hosts it knows (from your ssh config / extra hosts);
+    # an unmatched target is rejected here instead.
+    if host.host is None:
+        sys.exit(f"ssh-wiz: no such host: {rest[0]} "
+                 "(not found in your ssh config — pick it in the TUI)")
     opts = load_options()
     state = load_option_state()
     options = [state[label] for label, values in opts

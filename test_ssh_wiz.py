@@ -26,10 +26,10 @@ sys.modules["sshwiz"] = shw
 _loader.exec_module(shw)
 shw._tui()  # define the TUI classes; defers the textual import out of module load
 
-# The module's own list (8 entries) — kept in sync by construction, so
-# setUp/tearDown re-point and restore every path global (incl. OPTIONS_FILE
-# and OPTION_STATE_FILE).
-_PATH_ATTRS = shw._PATH_ATTRS
+# The module's declarative demo-path registry (8 entries). setUp/tearDown
+# re-point and restore every path global it names (incl. OPTIONS_FILE and
+# OPTION_STATE_FILE); naming them here keeps the test in sync by construction.
+_DEMO_PATHS = shw._DEMO_PATHS
 
 
 class TempPathsTestCase(unittest.TestCase):
@@ -45,7 +45,7 @@ class TempPathsTestCase(unittest.TestCase):
         self.options_file = root / "options"
         self.favorites = root / "favorites"
         self.option_state = root / "options.json"
-        self._saved = {a: getattr(shw, a) for a in _PATH_ATTRS}
+        self._saved = {a: getattr(shw, a) for a in _DEMO_PATHS}
         vars(shw).update(
             {
                 "SSH_CONFIG": self.ssh_config,
@@ -135,17 +135,22 @@ class ParseExtraHostsTest(TempPathsTestCase):
     def test_entries(self):
         self.extra_hosts.write_text(
             "# comment\n"
-            "myhost  alice@example.com:8022  -o Foo=bar\n"
+            "myhost  alice@example.com:8022  -o Foo=bar -o LogLevel=ERROR\n"
             "plain  bob@example.com\n"
             "nouser  example.org\n"
             "broken  justonefield\n"
         )
-        entries = shw.parse_extra_hosts(self.extra_hosts)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            entries = shw.parse_extra_hosts(self.extra_hosts)
         self.assertEqual(
             [e["name"] for e in entries], ["myhost", "plain", "nouser", "broken"]
         )
         self.assertEqual(entries[0]["target"], "alice@example.com:8022")
-        self.assertEqual(entries[0]["extra"], "-o Foo=bar")
+        # the extra-args allowlist drops the disallowed -o option (Foo) but
+        # keeps the allowed one (LogLevel): the extra column is an untrusted
+        # boundary spliced into the ssh argv
+        self.assertEqual(entries[0]["extra"], "-o LogLevel=ERROR")
         self.assertEqual(entries[2]["extra"], "")
 
     def test_malformed_extra_args_warned_and_dropped(self):
@@ -1304,8 +1309,8 @@ class FileSyncParserTest(unittest.TestCase):
 
     def test_fmt_size(self):
         self.assertEqual(shw.fmt_size(512), "512B")
-        self.assertEqual(shw.fmt_size(1024), "1K")
-        self.assertEqual(shw.fmt_size(1536), "2K")
+        self.assertEqual(shw.fmt_size(1024), "1KB")
+        self.assertEqual(shw.fmt_size(1536), "2KB")
 
     def test_parse_progress(self):
         # (cumulative bytes, pct, speed B/s, eta s, xfr-done); speed is
