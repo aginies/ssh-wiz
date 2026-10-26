@@ -1269,6 +1269,37 @@ class FileListFilteredTest(unittest.TestCase):
         self.assertLess(elapsed, 0.005)  # 20 cache hits in < 5 ms
 
 
+class FileListColumnsTest(unittest.TestCase):
+    """The panel columns are fitted to the usable width: the name keeps its
+    minimum, then the size goes, then the date falls back to 'MMM DD'."""
+
+    @staticmethod
+    def _rows(mtime=1.0, size=1234567):
+        return [shw.FileEntry(name="f.txt", path="/x/f.txt", size=size, mtime=mtime)]
+
+    def test_columns_fit_the_room(self):
+        lst = shw.FileList()
+        rows = self._rows()
+        self.assertEqual(lst._columns(rows, 60), (13, 3))  # room for everything
+        self.assertEqual(lst._columns(rows, 20), (7, 3))  # date drops HH:MM
+        self.assertEqual(lst._columns(rows, 14), (0, 3))  # size only
+        self.assertEqual(lst._columns(rows, 9), (0, 0))  # name only
+
+    def test_columns_without_dates_or_sizes(self):
+        lst = shw.FileList()
+        # no usable mtime -> no date column at any width
+        self.assertEqual(lst._columns(self._rows(mtime=0.0), 60), (0, 3))
+        # zero sizes -> no size column
+        self.assertEqual(lst._columns(self._rows(size=0), 60), (13, 0))
+
+    def test_name_width_is_clamped_to_the_room(self):
+        lst = shw.FileList()
+        rows = [shw.FileEntry(name="n" * 60, path="/x/n")]
+        self.assertEqual(lst._name_width(rows, 200), 45)  # never huge
+        self.assertEqual(lst._name_width(rows, 30), 30)  # clipped to the room
+        self.assertEqual(lst._name_width(rows, 3), shw._MIN_NAME_W)  # floor
+
+
 class FileSyncParserTest(unittest.TestCase):
     def test_parse_rsync_listing(self):
         out = (
@@ -1283,6 +1314,26 @@ class FileSyncParserTest(unittest.TestCase):
         self.assertTrue(entries[0].is_dir)
         self.assertEqual(entries[1].size, 0)
         self.assertEqual(entries[2].size, 7)
+
+    def test_parse_rsync_listing_dates_and_human_sizes(self):
+        # the listing runs `rsync --list-only -h`, so sizes come back in
+        # rsync's human form ('11,04K') and the date/time pair is the mtime
+        out = (
+            "-rw-r--r--          11,04K 2026/10/23 14:13:52 CHANGELOG.md\n"
+            "-rw-r--r--             51 2026/10/05 20:59:39 .gitignore\n"
+            "drwxr-xr-x           4,10K bogus-date bogus-time sub\n"
+        )
+        entries = {e.name: e for e in shw.parse_rsync_listing(out)}
+        self.assertEqual(entries["CHANGELOG.md"].size, 11_040)
+        self.assertEqual(entries[".gitignore"].size, 51)
+        want = time.mktime(time.strptime("2026/10/23 14:13:52", "%Y/%m/%d %H:%M:%S"))
+        self.assertEqual(entries["CHANGELOG.md"].mtime, want)
+        self.assertEqual(
+            entries[".gitignore"].mtime,
+            time.mktime(time.strptime("2026/10/05 20:59:39", "%Y/%m/%d %H:%M:%S")),
+        )
+        # an unparseable stamp leaves the mtime unknown rather than crashing
+        self.assertEqual(entries["sub"].mtime, 0.0)
 
     def test_parse_rsync_listing_ignores_dot_entries(self):
         entries = shw.parse_rsync_listing("drwxr-xr-x 1 .\n-rw-r--r-- 2 ../\n")
@@ -1306,6 +1357,48 @@ class FileSyncParserTest(unittest.TestCase):
             entries = shw.list_local_dir(Path(d))
             self.assertTrue(entries[0].is_dir)  # sub first
             self.assertEqual([e.name for e in entries[1:]], ["a.txt", "b.txt"])
+
+    def test_list_local_dir_carries_mtimes(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d, "a.txt")
+            f.write_text("y")
+            os.utime(f, (1_000_000, 1_000_000))
+            entries = shw.list_local_dir(Path(d))
+            self.assertEqual(entries[0].name, "a.txt")
+            self.assertEqual(entries[0].mtime, 1_000_000)
+            self.assertEqual(entries[0].size, 1)
+
+    def test_fmt_date(self):
+        self.assertEqual(shw.fmt_date(0.0), "")  # unknown mtime -> empty cell
+        now = time.time()
+        recent, old, future = now - 3600, now - 400 * 86400, now + 86400
+        # a file touched in the last six months (or dated in the future) shows
+        # the time; an older one shows the year instead
+        self.assertEqual(
+            shw.fmt_date(recent, now),
+            time.strftime("%b %d %H:%M", time.localtime(recent)),
+        )
+        self.assertEqual(
+            shw.fmt_date(future, now),
+            time.strftime("%b %d %H:%M", time.localtime(future)),
+        )
+        self.assertEqual(
+            shw.fmt_date(old, now), time.strftime("%b %d  %Y", time.localtime(old))
+        )
+        self.assertIn(":", shw.fmt_date(recent, now))
+        self.assertNotIn(":", shw.fmt_date(old, now))
+        # the column is fixed width, so rows stay aligned
+        for ts in (recent, old, future):
+            self.assertEqual(len(shw.fmt_date(ts, now)), 12)
+        # the short form (used when the panel is too narrow) drops the
+        # year/time but keeps the same fixed width on every row
+        for ts in (recent, old, future):
+            self.assertEqual(
+                shw.fmt_date(ts, now, short=True),
+                time.strftime("%b %d", time.localtime(ts)),
+            )
+            self.assertEqual(len(shw.fmt_date(ts, now, short=True)), 6)
+        self.assertEqual(shw.fmt_date(0.0, short=True), "")
 
     def test_fmt_size(self):
         self.assertEqual(shw.fmt_size(512), "512B")
@@ -1478,6 +1571,78 @@ class FileSyncTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 self.assertIn("1 selected", bar)
                 await pilot.press("space")
                 self.assertFalse(local.entries[0].selected)
+
+    async def test_rows_show_the_file_dates(self):
+        # each panel row carries an ls-style mtime column next to the size,
+        # and the whole row still fits the panel (no wrapping)
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                ts = time.time() - 3600
+                local.entries = [
+                    shw.FileEntry(
+                        name="recent.txt", path="/tmp/recent.txt", size=2048, mtime=ts
+                    ),
+                    shw.FileEntry(
+                        name="old.txt",
+                        path="/tmp/old.txt",
+                        size=4_000_000,
+                        mtime=time.mktime(
+                            time.strptime("2001/02/03 04:05:06", "%Y/%m/%d %H:%M:%S")
+                        ),
+                    ),
+                ]
+                lines = str(local.render()).splitlines()
+                self.assertIn(shw.fmt_date(ts), lines[0])
+                self.assertIn("2KB", lines[0])
+                self.assertIn("2001", lines[1])  # older than 6 months -> year
+                for line in lines:
+                    self.assertLessEqual(len(line), local.size.width)
+                # entries without a usable mtime drop the date column entirely
+                local.entries = [shw.FileEntry(name="nodate.txt", path="/tmp/x")]
+                self.assertNotIn(shw.fmt_date(ts), str(local.render()))
+
+    async def test_long_names_are_clipped_not_wrapped(self):
+        # a narrow panel drops the size, then the year/time of the date, and
+        # clips the name with an ellipsis — one row per entry, never wrapped
+        self.write_hosts()
+        app = shw.SSHWiz()
+        with mock.patch.object(
+            shw.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeRsyncProc()),
+        ):
+            async with app.run_test(size=(60, 24)) as pilot:
+                await pilot.press("ctrl+s")
+                local = app.screen.query_one("#local-list", shw.FileList)
+                ts = time.time() - 3600
+                local.entries = [
+                    shw.FileEntry(
+                        name="a-name-that-cannot-possibly-fit.txt",
+                        path="/tmp/a",
+                        size=1234567,
+                        mtime=ts,
+                    ),
+                    shw.FileEntry(name="short.txt", path="/tmp/s", size=512, mtime=ts),
+                ]
+                lines = str(local.render()).splitlines()
+                self.assertEqual(len(lines), 2)  # one row each: nothing wrapped
+                self.assertIn("…", lines[0])
+                short = shw.fmt_date(ts, short=True)
+                for line in lines:
+                    self.assertIn(short, line)  # the date survives, shortened
+                    self.assertLessEqual(len(line), local.size.width)
+                self.assertIn("1MB", lines[0])  # the size column survives too
+                self.assertIn("512B", lines[1])
+                # both rows keep the date column aligned
+                self.assertEqual(lines[0].index(short), lines[1].index(short))
 
     async def test_space_toggles_visible_row_not_hidden_entry(self):
         # The cursor indexes the *visible* rows: with hidden entries present

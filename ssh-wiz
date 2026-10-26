@@ -704,6 +704,7 @@ class FileEntry:
     is_dir: bool = False
     is_symlink: bool = False
     size: int = 0
+    mtime: float = 0.0   # modification time, epoch seconds (0.0 = unknown)
     selected: bool = False
 
     @property
@@ -815,12 +816,13 @@ def list_local_dir(path: Path) -> list:
             for d in it:
                 try:
                     is_link = d.is_symlink()
+                    st = d.stat(follow_symlinks=False)
                     entries.append(FileEntry(
                         name=d.name, path=d.path,
                         is_dir=not is_link and d.is_dir(),
                         is_symlink=is_link,
-                        size=0 if is_link
-                        else d.stat(follow_symlinks=False).st_size))
+                        size=0 if is_link else st.st_size,
+                        mtime=st.st_mtime))
                 except OSError:
                     continue
     except OSError:
@@ -831,27 +833,47 @@ def list_local_dir(path: Path) -> list:
 
 def parse_rsync_listing(output: str) -> list:
     """Parse `rsync --list-only` lines: 'perms size date time name' (name may
-    contain spaces); dirs first, then A->Z."""
+    contain spaces); dirs first, then A->Z. The size is either a raw byte
+    count or an rsync -h human value ('11,04K'); the date/time pair is the
+    remote host's local time and becomes FileEntry.mtime."""
     entries: list = []
     for line in output.splitlines():
         fields = line.split(None, 4)
         if len(fields) < 5:
             continue
-        perms, size, _date, _time, name = fields
+        perms, size, date, stamp, name = fields
         name = name.removeprefix("./")
         if name in (".", ".."):
             continue
-        try:
-            size_i = int(size)
-        except ValueError:
-            size_i = 0
         entries.append(FileEntry(
             name=name, path=name,
             is_dir=perms.startswith("d"),
             is_symlink=perms.startswith("l"),
-            size=size_i))
+            size=_parse_listing_size(size),
+            mtime=_parse_listing_date(date, stamp)))
     entries.sort(key=lambda e: (not e.is_dir, e.name.lower()))
     return entries
+
+
+# rsync --list-only size field: a raw byte count, optionally with locale digit
+# grouping ('41943040', '42.621.440'), or with -h a human SI value ('11,04K').
+_LISTING_SIZE_RE = re.compile(r"^(\d+(?:[.,]\d+)*)([KMGTPE])?$")
+
+
+def _parse_listing_size(raw: str) -> int:
+    """rsync --list-only size field -> int bytes (0 when unrecognised)."""
+    m = _LISTING_SIZE_RE.match(raw)
+    return _parse_rsync_size(*m.groups()) if m else 0
+
+
+def _parse_listing_date(date: str, stamp: str) -> float:
+    """rsync --list-only 'YYYY/MM/DD HH:MM:SS' -> epoch seconds, or 0.0 when
+    it can't be parsed. Read as *local* time: the stamp is the remote host's
+    local time, and it is only ever compared against the local clock."""
+    try:
+        return time.mktime(time.strptime(f"{date} {stamp}", "%Y/%m/%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return 0.0
 
 
 def parse_itemize(line: str) -> tuple[str, str] | None:
@@ -949,6 +971,29 @@ def fmt_size(n: int) -> str:
         if n < mult * 1000:
             return f"{n / mult:.0f}{unit}B"
     return f"{n / 10**15:.0f}PB"
+
+
+# FileList column budget: the date column is ' MMM DD HH:MM ' (13 cells) or,
+# when the panel is too narrow for the year/time, ' MMM DD ' (7). The name
+# column never gives up its _MIN_NAME_W cells — past that a column is dropped,
+# because a clipped row is still readable while a wrapped one is not.
+_DATE_W, _DATE_W_SHORT, _MIN_NAME_W = 13, 7, 8
+
+
+def fmt_date(ts: float, now: float | None = None, short: bool = False) -> str:
+    """An mtime (epoch seconds) as a compact ls-style stamp of fixed width:
+    12 cells, 'MMM DD HH:MM' for a file touched in the last six months (or
+    dated in the future, where the year is the boring part) and 'MMM DD  YYYY'
+    for an older one; or 6 cells, 'MMM DD', when ``short`` is set (a narrow
+    panel has no room for the year/time). '' when ts is 0.0, i.e. when the
+    listing carried no usable date."""
+    if not ts:
+        return ""
+    if short:
+        return time.strftime("%b %d", time.localtime(ts))
+    now = time.time() if now is None else now
+    fmt = "%b %d %H:%M" if now - ts < 182 * 86400 else "%b %d  %Y"
+    return time.strftime(fmt, time.localtime(ts))
 
 
 def fmt_speed(bps: float) -> str:
@@ -1646,7 +1691,9 @@ def _tui():
     class FileList(Widget):
         """A checkbox file list for the file-sync screen (local or remote). ↑↓
         moves the cursor, space toggles selection. Rendered with a ☐/☑ column,
-        a name column and a dim size column; dirs are listed first, then A->Z.
+        a name column, an ls-style mtime column and a size column; dirs are
+        listed first, then A->Z. The columns are fitted to the panel width, so
+        a narrow terminal keeps a usable name prefix instead of wrapping rows.
         Hidden ('dot') entries are hidden unless ``show_hidden`` is set (toggled
         with ``h`` on the screen). The active panel is highlighted with an
         accent border (and a brighter path bar) so you always know which side
@@ -1709,8 +1756,32 @@ def _tui():
                 self.cursor = len(rows) - 1
             return rows[self.cursor]
 
+        def _columns(self, rows, room: int) -> tuple:
+            """(date column width, size column width) that fit in ``room`` cells.
+            Tried widest first, and the name always keeps _MIN_NAME_W cells, so
+            a narrow panel loses the size, then the year/time of the date, and
+            only then starts clipping names."""
+            size_w = max((len(fmt_size(e.size)) for e in rows if e.size), default=0)
+            dates = (_DATE_W, _DATE_W_SHORT, 0) if any(e.mtime for e in rows) else (0,)
+            sizes = (size_w, 0) if size_w else (0,)
+            for date_w in dates:
+                for sw in sizes:
+                    if room - date_w - sw - (1 if sw else 0) >= _MIN_NAME_W:
+                        return date_w, sw
+            return 0, 0
+
+        def _name_width(self, rows, room: int) -> int:
+            """Name column width: the longest visible name plus padding (the
+            spare cells keep a directory's trailing '/' clear of the date),
+            clamped to ``room`` — what is left of the panel once the ☐, date and
+            size columns are paid for — and to [_MIN_NAME_W, 45] so a narrow
+            terminal still shows a readable prefix while a wide one doesn't grow
+            a huge gap."""
+            return max(_MIN_NAME_W,
+                       min(45, max(len(e.name) for e in rows) + 2, room))
+
         def render(self) -> Text:
-            t = Text(end="")
+            t = Text(no_wrap=True, end="")
             rows = self.filtered
             if not rows:
                 if self.title == "remote" and self.error:
@@ -1720,8 +1791,16 @@ def _tui():
                 msg = "empty directory" if self.title == "local" else "loading…"
                 t.append(f"  {msg}", style="dim")
                 return t
-            name_w = min(45, max(14, max(len(e.name) for e in rows) + 2))
-            height = max(1, self.size.height)
+            # ``size`` is the whole box, border included: the usable cells are
+            # what is left of the border/padding gutter.
+            gutter = self.styles.gutter
+            width = max(1, self.size.width - gutter.width)
+            height = max(1, self.size.height - gutter.height)
+            # Column widths are negotiated against the usable cells (the ☐
+            # column costs 2), so no row ever wraps inside a narrow panel.
+            date_w, size_w = self._columns(rows, width - 2)
+            name_w = self._name_width(
+                rows, width - 2 - date_w - size_w - (1 if size_w else 0))
             if self.cursor >= len(rows):
                 self.cursor = len(rows) - 1
             crow = self.cursor
@@ -1734,11 +1813,20 @@ def _tui():
                 # harsh white of reverse) so you always know where you are.
                 row_style = Style(bgcolor="#26405b") if r == self.cursor else Style()
                 name = e.name + ("/" if (e.is_dir and not e.is_symlink) else "")
-                line = Text()
+                if len(name) > name_w:
+                    # clip to the column (an ellipsis marks it) so the date and
+                    # size columns stay aligned on a narrow panel
+                    name = name[:name_w - 1] + "…"
+                line = Text(no_wrap=True, end="")
                 line.append(f"{box} ", style=("green" if e.selected else "dim"))
                 line.append(f"{name:<{name_w}}", style=row_style)
+                if date_w:
+                    # leading space: the stamp never sticks to a clipped name
+                    stamp = fmt_date(e.mtime, short=(date_w == _DATE_W_SHORT))
+                    line.append(f" {stamp:<{date_w - 1}}", style=row_style)
                 if e.size:
-                    line.append(fmt_size(e.size), style=row_style)
+                    # right-aligned in its own column, ls-style
+                    line.append(f" {fmt_size(e.size):>{size_w}}", style=row_style)
                 t.append_text(line)
                 t.append("\n")
             return t

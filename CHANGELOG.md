@@ -14,9 +14,27 @@ All notable changes to this project are documented in this file.
   to the transfer speed while a transfer is in progress, parsed from rsync's
   own `--info=progress2` output. The ETA disappears when rsync can't estimate
   it (e.g. speed is still zero at the very start).
+- File sync (`^s`): both panels now show the modification date of every entry,
+  in an ls-style column between the name and the size — `MMM DD HH:MM` for a
+  file touched in the last six months (or dated in the future), `MMM DD  YYYY`
+  for an older one. Local dates come from `stat`, remote ones from the
+  `rsync --list-only` listing (read as the remote host's local time). The
+  ☐/name/date/size columns are fitted to the panel width and rows no longer
+  wrap: a too-narrow panel first drops the size column, then shortens the date
+  to `MMM DD`, and only then clips the name with an ellipsis. The date column
+  disappears entirely when a listing carries no usable mtime.
 
 ### Fixed
 
+- File sync (`^s`): the remote panel never showed a file size. The listing runs
+  `rsync --list-only -h`, whose size field is rsync's own human form (`11,04K`),
+  and `parse_rsync_listing` passed it to `int()` — every remote size silently
+  became 0 and the column was skipped. Sizes now go through the same SI parser
+  as the progress samples (`_parse_listing_size`), so the two panels agree, and
+  locale digit grouping (`42.621.440`) is accepted too.
+- `FileList.render` measured its rows against the widget's *outer* size, so the
+  two rows it drew last landed under the panel's round border. Row count and
+  row width now subtract the border/padding gutter.
 - `build_transfer_cmd(direction="down")`: absolute remote sources (e.g.
   `/var/log/syslog`) were stripped of their leading slash and silently fetched
   from the remote home instead. The down path was unreachable from the UI

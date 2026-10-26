@@ -104,6 +104,13 @@ currently selected host (browsed with `rsync --list-only`).
   background (not a harsh highlight bar) so you can always tell where you are,
   even after switching panels (`Tab` keeps the cursor on the last item you
   selected).
+- Each row shows an ls-style date column next to the size: `MMM DD HH:MM` for a
+  file touched in the last six months (or dated in the future), `MMM DD  YYYY`
+  for an older one. Local dates come from `stat`, remote ones from the
+  `rsync --list-only` listing (the remote host's clock). The ☐/name/date/size
+  columns are fitted to the panel width so a row never wraps: a too-narrow panel
+  drops the size column, then shortens the date to `MMM DD`, and only then clips
+  the name with an ellipsis.
 - `?`/`F1` shows sync help, `esc`/`q` closes.
 
 The two panels are separated by a vertical line, the right-hand path bar shows the
