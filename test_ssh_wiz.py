@@ -5,6 +5,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import stat
@@ -686,6 +687,60 @@ class TuiRenderTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("tmux", text)
                 await pilot.press("escape")
 
+    async def test_host_detail_overlay_runs_ssh_g(self):
+        # ^d opens the detail overlay; `ssh -G` runs off the UI thread and
+        # its output lands in the body. Textual runs the terminal in raw
+        # mode, so ctrl+d is delivered as a key (never interpreted as EOF).
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        fake = subprocess.CompletedProcess(
+            ["ssh"], 0, stdout="user alice\nhostname alpha\nport 22\n", stderr=""
+        )
+        with mock.patch.object(shw.subprocess, "run", return_value=fake) as run:
+            app = shw.SSHWiz()
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+d")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.HostDetailScreen)
+                body = str(app.screen.query_one("#detail-body", shw.Static).render())
+                self.assertIn("hostname alpha", body)
+                self.assertIn("user alice", body)
+                # modal: typing does not leak into the filter underneath
+                await pilot.press("a")
+                self.assertEqual(app.query_one(shw.HostList).filter, "")
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, shw.HostDetailScreen)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:2], ["ssh", "-G"])
+        self.assertEqual(argv[-1], "alpha")
+
+    async def test_host_detail_overlay_ssh_g_failure(self):
+        self.ssh_config.write_text("Host alpha\n  User alice\n")
+        fake = subprocess.CompletedProcess(["ssh"], 255, stdout="", stderr="boom\n")
+        with mock.patch.object(shw.subprocess, "run", return_value=fake):
+            app = shw.SSHWiz()
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.press("ctrl+d")
+                await pilot.pause()
+                body = str(app.screen.query_one("#detail-body", shw.Static).render())
+                self.assertIn("boom", body)
+                self.assertIn("255", body)
+                await pilot.press("q")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, shw.HostDetailScreen)
+
+    async def test_host_detail_overlay_empty_list_noop(self):
+        # no hosts at all: ^d must be a no-op (nothing selected)
+        self.ssh_config.write_text("")
+        app = shw.SSHWiz()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one(shw.HostList).shown, [])
+            await pilot.press("ctrl+d")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, shw.HostDetailScreen)
+
 
 class BuildSshCmdTest(unittest.TestCase):
     def make_host(self, **kw):
@@ -742,6 +797,105 @@ class BuildSshCmdTest(unittest.TestCase):
         self.assertEqual(shw.tmux_session_name(h2), "wiz-user-10-0-1-5-99")
         h3 = shw.Host(name="ryzen9.guibland.com (root)", display="", target="")
         self.assertEqual(shw.tmux_session_name(h3), "wiz-ryzen9-guibland-com-root")
+
+
+class BuildSshGCmdTest(unittest.TestCase):
+    def make_host(self, **kw):
+        base = {"name": "foo", "display": "alice@foo", "target": "foo"}
+        base.update(kw)
+        return shw.Host(**base)
+
+    def test_plain(self):
+        # ssh -G <target>: no -t, no remote command
+        self.assertEqual(shw.build_ssh_g_cmd(self.make_host()), ["ssh", "-G", "foo"])
+
+    def test_options_port_extra(self):
+        h = self.make_host(cmd_port="8022", extra="-o Foo=bar")
+        cmd = shw.build_ssh_g_cmd(h, ["ForwardX11=yes"])
+        self.assertEqual(cmd[:3], ["ssh", "-G", "-o"])
+        self.assertEqual(cmd[3], "ForwardX11=yes")
+        self.assertIn("-p", cmd)
+        self.assertEqual(cmd[-1], "foo")  # target is always last
+
+
+class LintConfigTest(TempPathsTestCase):
+    def write(self, text: str) -> None:
+        self.ssh_config.write_text(text)
+
+    def findings(self, severity=None):
+        out = shw.lint_config(self.ssh_config)
+        return [f for f in out if severity is None or f.severity == severity]
+
+    def test_missing_file_is_clean(self):
+        self.assertEqual(shw.lint_config(self.ssh_config), [])
+
+    def test_clean_config(self):
+        self.write("Host foo\n  User alice\n  Port 22\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_keyword_without_value(self):
+        self.write("Host foo\n  User alice\n  ForwardX11\n")
+        warns = self.findings("warn")
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0].line, 3)
+        self.assertIn("ForwardX11", warns[0].message)
+
+    def test_host_without_pattern(self):
+        self.write("Host foo\n  User alice\nHost\n")
+        warns = self.findings("warn")
+        self.assertTrue(any("no pattern" in f.message for f in warns))
+
+    def test_duplicate_host_is_note(self):
+        self.write("Host foo\n  User alice\nHost foo\n  Port 2222\n")
+        notes = self.findings("note")
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].line, 3)
+        self.assertIn("already defined on line 1", notes[0].message)
+        self.assertEqual(self.findings("warn"), [])
+
+    def test_dead_identityfile_warns(self):
+        self.write("Host foo\n  IdentityFile /no/such/key\n")
+        warns = self.findings("warn")
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0].line, 2)
+        self.assertIn("does not exist", warns[0].message)
+
+    def test_live_identityfile_ok(self):
+        key = Path(self._tmp.name) / "id_ed25519"
+        key.write_text("x")
+        self.write(f"Host foo\n  IdentityFile {key}\n")
+        self.assertEqual(self.findings("warn"), [])
+
+    def test_identityfile_with_token_skipped(self):
+        # ssh expands %d/%r/%h itself; we can't resolve it locally
+        self.write("Host foo\n  IdentityFile ~/.ssh/id_%r\n")
+        self.assertEqual(self.findings("warn"), [])
+
+    def test_wildcard_shadow_warns(self):
+        self.write("Host web*\n  User www\nHost web1\n  User alice\n")
+        warns = self.findings("warn")
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[0].line, 4)  # the losing 'User alice' line
+        self.assertIn("web1", warns[0].message)
+        self.assertIn("line 1", warns[0].message)
+
+    def test_later_wildcard_does_not_shadow(self):
+        # first-match-wins: an exact block BEFORE the wildcard keeps its value
+        self.write("Host web1\n  User alice\nHost web*\n  User www\n")
+        self.assertEqual(self.findings("warn"), [])
+
+    def test_wildcard_without_keyword_overlap_ok(self):
+        self.write("Host web*\n  Port 22\nHost web1\n  User alice\n")
+        self.assertEqual(self.findings("warn"), [])
+
+    def test_findings_sorted_by_line(self):
+        self.write("Host web*\n  User www\nHost web1\n  User a\n  IdentityFile /x/y\n")
+        lines = [f.line for f in shw.lint_config(self.ssh_config)]
+        self.assertEqual(lines, sorted(lines))
+
+    def test_comments_ignored(self):
+        self.write("# Host foo\nHost bar  # trailing\n  # User x\n  Port 22\n")
+        self.assertEqual(self.findings(), [])
 
 
 class MiscTest(TempPathsTestCase):
@@ -929,6 +1083,21 @@ class DemoTuiTest(TempPathsTestCase, unittest.IsolatedAsyncioTestCase):
             run.assert_not_called()  # no real ssh in demo mode
         self.assertTrue(any("would run: ssh" in str(c) for c in notify.call_args))
 
+    async def test_demo_host_detail_previews_not_runs(self):
+        shw.start_demo()
+        self.addCleanup(shw.stop_demo)
+        app = shw.SSHWiz()
+        with mock.patch.object(shw.subprocess, "run") as run:
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+d")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, shw.HostDetailScreen)
+                body = str(app.screen.query_one("#detail-body", shw.Static).render())
+                self.assertIn("would run", body)
+                self.assertIn("ssh -G", body)
+        run.assert_not_called()  # demo never runs the real probe
+
 
 class CliTest(TempPathsTestCase):
     def test_help(self):
@@ -950,6 +1119,60 @@ class CliTest(TempPathsTestCase):
             self.run_main("-l")
         self.assertIn("foo", out.getvalue())
         self.assertIn("alice@foo", out.getvalue())
+
+    def test_json(self):
+        self.ssh_config.write_text("Host foo\n  User alice\n  Port 2222\n")
+        self.favorites.write_text("foo\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--json")
+        data = json.loads(out.getvalue())
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["name"], "foo")
+        self.assertEqual(data[0]["user"], "alice")
+        self.assertEqual(data[0]["port"], "2222")
+        self.assertTrue(data[0]["favorite"])
+
+    def test_json_favorites_first(self):
+        self.ssh_config.write_text("Host a\n  User u\nHost b\n  User u\n")
+        self.favorites.write_text("b\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--json")
+        data = json.loads(out.getvalue())
+        self.assertEqual([h["name"] for h in data], ["b", "a"])
+        self.assertTrue(data[0]["favorite"])
+        self.assertFalse(data[1]["favorite"])
+
+    def test_check_clean_exit_zero(self):
+        self.ssh_config.write_text("Host foo\n  User alice\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--check")  # must not raise SystemExit
+        self.assertIn("OK", out.getvalue())
+
+    def test_check_warn_exit_one(self):
+        self.ssh_config.write_text("Host foo\n  IdentityFile /no/such/key\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                self.run_main("--check")
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("does not exist", out.getvalue())
+
+    def test_check_note_only_exit_zero(self):
+        # a duplicate Host block is a note: reported, but does not fail
+        self.ssh_config.write_text("Host foo\n  User a\nHost foo\n  Port 2\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--check")  # notes only: no SystemExit
+        self.assertIn("already defined", out.getvalue())
+
+    def test_check_missing_file(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_main("--check")
+        self.assertIn("nothing to check", out.getvalue())
 
     def test_f_requires_name(self):
         with self.assertRaises(SystemExit) as cm:
@@ -1058,7 +1281,9 @@ class CompletionTest(TempPathsTestCase):
     def test_flags_prefix_match(self):
         self.assertEqual(shw.complete_candidates("-l"), ["-l"])
         self.assertEqual(shw.complete_candidates("--l"), ["--list"])
-        self.assertEqual(shw.complete_candidates("--c"), ["--complete", "--completion"])
+        self.assertEqual(
+            shw.complete_candidates("--c"), ["--check", "--complete", "--completion"]
+        )
         self.assertEqual(shw.complete_candidates("-z"), [])
         self.assertEqual(shw.complete_candidates("-"), list(shw.CLI_FLAGS))
 

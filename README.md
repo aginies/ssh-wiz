@@ -10,6 +10,8 @@ reads your `~/.ssh/config` and gets you connected.
 - Add-host wizard (`^a`): key generation, `ssh-copy-id`, key-auth check,
   backed-up `~/.ssh/config` append
 - Live ssh command preview below the tabs (exactly what ⏎/^y will run)
+- Host detail overlay (`^d`): the effective `ssh -G` config for a host
+- `--json` host list and a `--check` config linter for scripting
 - Fuzzy shell completion for bash, zsh and fish
 - Single file, no build step
 
@@ -39,6 +41,8 @@ Put `ssh-wiz` on your `PATH` (it is a single executable script).
 ```
 ssh-wiz              launch the interactive picker
 ssh-wiz -l           list hosts (favorites first, A→Z), no TUI
+ssh-wiz --json       print the host list as JSON, no TUI
+ssh-wiz --check      lint ~/.ssh/config (duplicates, shadows, dead keys)
 ssh-wiz <host>       connect directly, no TUI
 ssh-wiz <host> cmd   connect and run cmd (and args) on the host
 ssh-wiz -p <host>    connect with -o PubkeyAuthentication=no
@@ -72,6 +76,7 @@ without exposing real infrastructure.
 | ^o | toggle the ssh options panel (↑↓ select, ←→/⏎ cycle value, esc close) |
 | ^t | toggle tmux mode (`tmux new -A -s wiz-<host>`; hint hidden when tmux is not installed) |
 | ^y | copy the ssh command for the selected host |
+| ^d | host detail overlay — the effective `ssh -G` config (esc/q/^d closes) |
 | ^e | open `~/.ssh/config` at the selected host (`$EDITOR`) |
 | ^g | open `~/.config/ssh-wiz/categories` (`$EDITOR`), then refresh |
 | ^s | open the twin-panel file sync (local ↔ remote via rsync) |
@@ -165,6 +170,50 @@ eval "$(ssh-wiz --completion zsh)"
 # fish
 ssh-wiz --completion fish | source
 ```
+
+### Scripting and diagnostics
+
+`ssh-wiz --json` prints the host list (favorites first, then A→Z — the same
+order as `-l`) as a JSON array, one object per host with every field the
+picker knows plus a `favorite` boolean. It never touches the network, so it
+is a safe, structured view of `~/.ssh/config` for scripts:
+
+```sh
+ssh-wiz --json | jq -r '.[] | select(.category=="PROD") | .target'
+```
+
+Each object carries: `name`, `display`, `target`, `label`, `category`,
+`user`, `host`, `port`, `cmd_port`, `principal`, `identityfile`, `extra`,
+`favorite`.
+
+`ssh-wiz --check` lints `~/.ssh/config` (read-only — it never rewrites or
+connects) and prints one `file:line: severity: message` per finding:
+
+- **warn** — a `Host` block whose keyword is silently overridden by an
+  earlier wildcard block (ssh is first-match-wins), an `IdentityFile` that
+  does not exist on disk, or a keyword/`Host` line with no value.
+- **note** — informational, e.g. duplicate exact `Host` blocks that ssh
+  merges on purpose (the documented multi-user pattern).
+
+The exit status is `1` when any **warn** is found, `0` otherwise (notes
+alone do not fail), so it drops straight into CI or a pre-commit hook:
+
+```sh
+ssh-wiz --check || echo "ssh config has warnings"
+```
+
+### Host detail (`^d`)
+
+In the picker, `^d` opens a scrollable overlay with the **effective**
+configuration for the selected host — the output of `ssh -G <target>`, which
+is what `~/.ssh/config` resolves to after all `Host`/`Match` blocks (user,
+hostname, port, identity files, proxies, …). The probe runs off the UI
+thread and never connects (`ssh -G` only prints and exits), so it is instant
+and side-effect free. `↑↓`/`PgUp`/`PgDn`/wheel scroll; `esc`/`q`/`^d` close.
+In `--demo` mode the command is shown but not run.
+
+> `^d` is safe as a binding: Textual puts the terminal in application (raw)
+> mode, so Ctrl-D is delivered to the app as a key rather than acting as EOF.
 
 ## Configuration
 

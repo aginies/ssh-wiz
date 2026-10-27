@@ -6,6 +6,25 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Host detail overlay (`^d`): a scrollable overlay showing the effective
+  ssh configuration for the selected host — the output of `ssh -G <target>`,
+  which is what `~/.ssh/config` resolves to after all `Host`/`Match` blocks
+  (user, hostname, port, identity files, proxies, …). The probe runs off the
+  UI thread and never connects (`ssh -G` prints and exits), so it is instant
+  and side-effect free; failures and non-zero exits are shown inline.
+  `↑↓`/`PgUp`/`PgDn`/wheel scroll, `esc`/`q`/`^d` close, and `--demo` shows
+  the command instead of running it.
+- `--json`: the host list (favorites first, then A→Z — the same order as
+  `-l`) as a JSON array, one object per host with every field the picker
+  knows plus a `favorite` boolean. Read-only and offline, so it is a safe
+  structured view of `~/.ssh/config` for scripts and tooling.
+- `--check`: a read-only linter for `~/.ssh/config` that prints one
+  `file:line: severity: message` per finding and never rewrites or connects.
+  It flags hosts whose keyword is silently overridden by an earlier wildcard
+  block (ssh is first-match-wins), `IdentityFile`s that don't exist on disk,
+  keyword/`Host` lines with no value (all **warn**), and duplicate exact
+  `Host` blocks that ssh merges on purpose (**note**). Exit status is `1`
+  when any warn is found, `0` otherwise, so it fits CI/pre-commit hooks.
 - File sync (`^s`): pull direction — `F6` (or `x`) copies the selected remote
   files into the local panel's current directory with the same rsync pipeline
   as the `F5` push (per-file results, live progress, demo preview). The local

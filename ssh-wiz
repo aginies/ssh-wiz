@@ -11,6 +11,8 @@ Usage:
   ssh-wiz --demo       launch the picker with built-in sample data
                        (fake hosts/categories, no real connections)
   ssh-wiz -l           list hosts (favorites first, A→Z), no TUI
+  ssh-wiz --json       print the host list as JSON, no TUI
+  ssh-wiz --check      lint ~/.ssh/config (duplicates, shadows, dead keys)
   ssh-wiz <host>       connect directly, no TUI
   ssh-wiz <host> cmd   connect and run cmd (and args) on the host
   ssh-wiz -p <host>    connect directly with -o PubkeyAuthentication=no
@@ -31,6 +33,7 @@ TUI keys:
   ^o        toggle ssh options panel (cycle -o values: no-pubkey, x11, …)
   ^t        toggle tmux mode (connect via: tmux new -A -s wiz-<host>)
   ^y        copy the ssh command for the selected host
+  ^d        host detail overlay: effective ssh config (`ssh -G`)
   ^s        open the file-sync screen (twin-panel, local <-> remote)
   ^a        add host (wizard: key, ssh-copy-id, config block)
   ^e        open ~/.ssh/config at the selected host ($EDITOR)
@@ -57,7 +60,7 @@ import sys
 import tempfile
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from rich.console import Console
@@ -694,6 +697,17 @@ def build_ssh_cmd(host: Host, options: list | None = None,
     if remote_cmd:
         cmd += remote_cmd
     return cmd
+
+
+SSH_G_TIMEOUT = 10  # seconds; `ssh -G` never connects, so it is near-instant
+
+
+def build_ssh_g_cmd(host: Host, options: list | None = None) -> list:
+    """`ssh -G <target>` argv: prints the effective configuration for
+    `host` (what ~/.ssh/config resolves to) and exits without connecting.
+    Carries the same -o/-p/extra args a real connection would, so the
+    output matches what enter/^y runs."""
+    return ["ssh", "-G", *_ssh_common_argv(host, options), host.target]
 
 
 @dataclass
@@ -1354,6 +1368,111 @@ def wildcard_shadows(name: str, path: Path | None = None) -> list:
     return out
 
 
+@dataclass
+class LintFinding:
+    """One `--check` finding: 1-based config line, severity, message.
+
+    severity is 'warn' (silently ignored/losing config, dead key file) or
+    'note' (informational, e.g. duplicate Host blocks that ssh merges on
+    purpose — the documented multi-user pattern)."""
+    line: int
+    severity: str
+    message: str
+
+
+def lint_config(path: Path | None = None) -> list:
+    """Lint ~/.ssh/config (or `path`); returns LintFindings sorted by line.
+
+    Read-only checks:
+    - keyword lines with no value (ssh would reject or ignore them)
+    - duplicate exact `Host` blocks (note: ssh merges them and the first
+      value per keyword wins — the documented multi-user pattern, so this
+      is informational, not a warning)
+    - exact hosts whose keyword loses to an earlier wildcard block that
+      sets the same keyword (ssh is first-match-wins, so the later value
+      is silently ignored)
+    - IdentityFile values that don't exist on disk (values containing ssh's
+      '%' tokens are skipped — they can't be resolved locally)
+
+    A missing config file lints clean (no config is valid)."""
+    path = path or SSH_CONFIG
+    lines = _read_config_lines(path)
+    if lines is None:
+        return []
+    findings: list = []
+    blocks: list = []   # [kind, line, host tokens, {keyword: first line}]
+    cur: list | None = None
+    for i, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        key = parts[0].lower()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        m = re.search(r"(^|\s)#", value)
+        if m:
+            value = value[:m.start()].strip()
+        if key in ("host", "match"):
+            cur = [key, i, value.split(), {}]
+            blocks.append(cur)
+            if not value:
+                findings.append(LintFinding(
+                    i, "warn", f"'{parts[0]}' has no pattern"))
+            continue
+        if cur is None:
+            cur = [None, i, [], {}]
+            blocks.append(cur)
+        if not value:
+            findings.append(LintFinding(
+                i, "warn", f"'{parts[0]}' has no value"))
+            continue
+        if (key == "identityfile" and "%" not in value
+                and not Path(value).expanduser().exists()):
+            findings.append(LintFinding(
+                i, "warn", f"IdentityFile '{value}' does not exist"))
+        cur[3].setdefault(key, i)
+
+    def _exact(tokens: list) -> list:
+        return [t for t in tokens
+                if not t.startswith("!") and not any(c in t for c in "*?")]
+
+    # duplicate exact Host names (note only: ssh merges the blocks)
+    seen: dict = {}
+    for kind, ln, tokens, _kw in blocks:
+        if kind != "host":
+            continue
+        for tok in _exact(tokens):
+            if tok in seen:
+                findings.append(LintFinding(
+                    ln, "note",
+                    f"Host '{tok}' already defined on line {seen[tok]} "
+                    "(ssh merges the blocks; first value wins)"))
+            else:
+                seen[tok] = ln
+    # exact hosts shadowed by an earlier wildcard block setting the same
+    # keyword: the exact block's value is silently ignored (first match wins)
+    for kind, ln, tokens, kw in blocks:
+        if kind != "host":
+            continue
+        for tok in _exact(tokens):
+            for wkind, wln, wtokens, wkw in blocks:
+                if wkind != "host" or wln >= ln:
+                    continue
+                if not any(fnmatch.fnmatchcase(tok, p)
+                           for p in wtokens if any(c in p for c in "*?")):
+                    continue
+                conflict = sorted(set(kw) & set(wkw))
+                if conflict:
+                    findings.append(LintFinding(
+                        kw[conflict[0]], "warn",
+                        f"Host '{tok}': {', '.join(conflict)} "
+                        f"loses to the wildcard block on line {wln} "
+                        "(ssh is first-match-wins)"))
+                    break
+    findings.sort(key=lambda f: (f.line, f.severity != "warn"))
+    return findings
+
+
 def append_host_to_config(spec: NewHost, path: Path | None = None,
                           when: str | None = None) -> Path:
     """Append spec's block to the ssh config (or `path`), backing the file
@@ -1416,16 +1535,17 @@ _TUI = False
 def _tui():
     """Import textual and define the TUI classes (once); returns SSHWiz."""
     global _TUI, hints_text, OPTIONS_HINTS, help_text, sync_help_text
-    global HelpScreen, ConfirmScreen, HostList, FileList, FileSyncScreen
+    global HelpScreen, HostDetailScreen, ConfirmScreen, HostList, FileList, \
+        FileSyncScreen
     global AddHostScreen, OptionsPanel, CmdLine, SSHWiz
     global events, App, ComposeResult, SuspendNotSupported, ModalScreen
-    global Screen, Widget, Container, Horizontal, Vertical, ProgressBar, \
-        Static, Button, Input, Select
+    global Screen, Widget, Container, Horizontal, Vertical, VerticalScroll, \
+        ProgressBar, Static, Button, Input, Select
     if _TUI:
         return SSHWiz
     from textual import events
     from textual.app import App, ComposeResult, SuspendNotSupported
-    from textual.containers import Container, Horizontal, Vertical
+    from textual.containers import Container, Horizontal, Vertical, VerticalScroll
     from textual.reactive import Reactive
     from textual.screen import ModalScreen, Screen
     from textual.widget import Widget
@@ -1437,7 +1557,7 @@ def _tui():
                  "^f: fav", "^o: opts"]
         if tmux_available():
             parts.append("^t: tmux")
-        parts += ["^y: copy", "^s: sync", "^a: add", "^e: edit",
+        parts += ["^y: copy", "^d: info", "^s: sync", "^a: add", "^e: edit",
                   "^g: cats", "esc: clear", "^q: quit"]
         return "    ".join(parts)
 
@@ -1461,6 +1581,7 @@ def _tui():
             lines.append("  ^t          toggle tmux mode (tmux new -A -s wiz-<host>)")
         lines += [
             "  ^y          copy the ssh command for the selected host",
+            "  ^d          host detail overlay (effective config via ssh -G)",
             "  ^s          file-sync screen (twin-panel local <-> remote)",
             "  ^a          add host (wizard: key + ssh-copy-id + config)",
             "  ^e          open ~/.ssh/config at the selected host",
@@ -1514,6 +1635,82 @@ def _tui():
 
         def on_key(self, event: events.Key) -> None:
             if event.key in ("escape", "ctrl+h", "question_mark", "f1", "q"):
+                self.app.pop_screen()
+            event.stop()
+
+
+    class HostDetailScreen(_Overlay, ModalScreen):
+        """Effective ssh config for one host (^d): the `ssh -G` output,
+        fetched off the UI thread and shown in a scrollable overlay.
+        esc/q/^d closes; ↑↓/PgUp/PgDn/wheel scroll."""
+        CSS = """
+        HostDetailScreen {
+            align: center middle;
+        }
+        HostDetailScreen #detail-box {
+            width: 86;
+            height: 80%;
+            border: heavy $primary;
+            background: $surface;
+            padding: 0 1;
+        }
+        HostDetailScreen #detail-title {
+            width: 100%;
+            text-style: bold;
+            color: $text;
+        }
+        HostDetailScreen #detail-body {
+            width: 100%;
+            height: auto;
+            color: $text-muted;
+        }
+        """
+
+        def __init__(self, host: Host, options: list | None = None) -> None:
+            super().__init__()
+            self._host = host
+            self._options = options or []
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="detail-box"):
+                yield Static(f"ssh -G {self._host.display}  (esc closes)",
+                             id="detail-title")
+                with VerticalScroll(id="detail-scroll"):
+                    yield Static("running ssh -G …", id="detail-body")
+
+        async def on_mount(self) -> None:
+            scroller = self.query_one("#detail-scroll")
+            scroller.can_focus = True
+            scroller.focus()
+            await self._load()
+
+        async def _load(self) -> None:
+            """Run `ssh -G` off the UI thread (asyncio.to_thread, like the
+            wizard's probes) and fill the body. Never connects: ssh -G
+            only prints the resolved configuration."""
+            cmd = build_ssh_g_cmd(self._host, self._options)
+            body = self.query_one("#detail-body", Static)
+            if DEMO:
+                body.update("[bold]demo mode — would run:[/] "
+                            + escape(" ".join(cmd))
+                            + "\n\n(no real ssh -G output in demo mode)")
+                return
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True,
+                    timeout=SSH_G_TIMEOUT, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                body.update(f"[bold red]ssh -G failed:[] {escape(str(e))}")
+                return
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip()
+                body.update(f"[bold red]ssh -G exit {proc.returncode}:[]\n"
+                            + escape(err))
+                return
+            body.update(escape(proc.stdout.strip() or "(no output)"))
+
+        def on_key(self, event: events.Key) -> None:
+            if event.key in ("escape", "q", "ctrl+d"):
                 self.app.pop_screen()
             event.stop()
 
@@ -3236,6 +3433,19 @@ def _tui():
             else:
                 self.push_screen(HelpScreen())
 
+        def show_host_detail(self) -> None:
+            """^d: effective ssh config (ssh -G) for the selected host, in a
+            scrollable overlay. The probe runs off the UI thread; in demo
+            mode the command is shown, not run."""
+            if isinstance(self.screen, HostDetailScreen):
+                self.pop_screen()
+                return
+            hl = self.query_one(HostList)
+            if not hl.shown:
+                return
+            self.push_screen(
+                HostDetailScreen(hl.shown[hl.cursor], self.enabled_options()))
+
         def toggle_options_panel(self) -> None:
             panel = self.query_one(OptionsPanel)
             if self.options_open:
@@ -3435,6 +3645,9 @@ def _tui():
                         self.notify(f"no clipboard tool (wl-copy/xclip/xsel/pbcopy) — {escape(cmd)}",
                                     severity="warning")
                 event.stop()
+            elif key == "ctrl+d":
+                self.show_host_detail()
+                event.stop()
             elif key == "ctrl+e":
                 self.edit_config()
                 event.stop()
@@ -3466,8 +3679,8 @@ def _tui():
 
 # Flags offered for '-...' prefixes (single source of truth; the completion
 # scripts only encode argument positions).
-CLI_FLAGS = ("-l", "--list", "-f", "-p", "--password", "-t", "--tmux",
-             "--demo", "--complete", "--completion",
+CLI_FLAGS = ("-l", "--list", "--json", "--check", "-f", "-p", "--password",
+             "-t", "--tmux", "--demo", "--complete", "--completion",
              "-h", "--help", "-V", "--version")
 
 
@@ -3721,6 +3934,25 @@ def run_main(args: list) -> None:
             sys.exit(f"ssh-wiz: unknown completion shell: {shell} "
                      f"(want bash, zsh or fish)")
         print(script)
+        return
+    if args[0] == "--json":
+        rules = load_category_rules(CATEGORIES_FILE)
+        hosts, favs = rank_hosts(build_hosts(rules))
+        print(json.dumps([{**asdict(h), "favorite": h.name in favs}
+                          for h in hosts], indent=2))
+        return
+    if args[0] == "--check":
+        if not SSH_CONFIG.exists():
+            print(f"ssh-wiz: no ssh config at {SSH_CONFIG} — nothing to check")
+            return
+        findings = lint_config()
+        if not findings:
+            print(f"{SSH_CONFIG}: OK — no findings")
+            return
+        for f in findings:
+            print(f"{SSH_CONFIG}:{f.line}: {f.severity}: {f.message}")
+        if any(f.severity == "warn" for f in findings):
+            sys.exit(1)  # warns fail (notes only: still exit 0)
         return
     if args[0] in ("-l", "--list"):
         rules = load_category_rules(CATEGORIES_FILE)
